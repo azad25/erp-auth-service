@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -14,11 +14,17 @@ import (
 	grpcServer "erp-auth-service/internal/grpc"
 	"erp-auth-service/internal/redis"
 	"erp-auth-service/internal/router"
+	"erp-auth-service/internal/seeder"
 
 	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Parse command line flags
+	seedFlag := flag.Bool("seed", false, "Run database seeding")
+	seedMinimal := flag.Bool("seed-minimal", false, "Run minimal database seeding")
+	flag.Parse()
+
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment variables")
@@ -31,6 +37,33 @@ func main() {
 	db, err := database.Initialize(cfg.Database)
 	if err != nil {
 		log.Fatal("Failed to initialize database:", err)
+	}
+
+	// Handle seeding if requested via command line flags
+	if *seedFlag || *seedMinimal {
+		s := seeder.NewSeeder(db)
+		
+		if *seedMinimal {
+			log.Println("🌱 Running minimal database seeding...")
+			if err := s.SeedMinimal(); err != nil {
+				log.Fatal("Failed to run minimal seeding:", err)
+			}
+		} else {
+			log.Println("🌱 Running full database seeding...")
+			if err := s.SeedAll(); err != nil {
+				log.Fatal("Failed to run full seeding:", err)
+			}
+		}
+		
+		log.Println("✅ Seeding completed, exiting...")
+		return
+	}
+
+	// Seed database with initial data on startup (if not already seeded)
+	seederInstance := seeder.NewSeeder(db)
+	if err := seederInstance.SeedAll(); err != nil {
+		log.Printf("Warning: Failed to seed database: %v", err)
+		// Don't fail startup if seeding fails, just log the warning
 	}
 
 	// Initialize Redis
@@ -46,9 +79,9 @@ func main() {
 	})
 	defer kafkaProducer.Close()
 
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Context for graceful shutdown (simplified for now)
+	// ctx, cancel := context.WithCancel(context.Background())
+	// defer cancel()
 
 	// Wait group for goroutines
 	var wg sync.WaitGroup
@@ -86,9 +119,6 @@ func main() {
 	// Block until signal received
 	<-sigChan
 	log.Println("Shutting down servers...")
-
-	// Cancel context to signal shutdown
-	cancel()
 
 	// Wait for all goroutines to finish
 	wg.Wait()
