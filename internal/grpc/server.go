@@ -10,7 +10,7 @@ import (
 	"erp-auth-service/internal/config"
 	"erp-auth-service/internal/middleware"
 	"erp-auth-service/internal/models"
-	pb "erp-auth-service/proto/auth"
+	pb "erp-auth-service/auth"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"

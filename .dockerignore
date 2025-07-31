@@ -1,0 +1,32 @@
+# Ignore generated files
+auth/
+main
+*.log
+
+# Ignore development files
+.env
+.env.local
+.env.development
+.env.test
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore documentation
+README.md
+docs/
+
+# Ignore test files
+*_test.go
+test/

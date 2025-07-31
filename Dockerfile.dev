@@ -1,48 +1,37 @@
-# Development Dockerfile for Auth Service (Go)
-FROM golang:1.23-alpine AS builder
-
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
-
-# Set working directory
-WORKDIR /app
-
-# Copy go mod files
-COPY go.mod go.sum ./
-
-# Download dependencies
-RUN go mod download
-
-# Copy source code
-COPY . .
-
-# Note: Proto files should be pre-generated locally for development
-# Run: protoc --proto_path=proto --go_out=. --go-grpc_out=. proto/*.proto
-
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
-
-# Final stage
-FROM alpine:latest
+# Development Dockerfile for Auth Service (Go) - Single stage for faster builds
+FROM golang:1.23-alpine
 
 # Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata curl
+RUN apk add --no-cache git ca-certificates tzdata protobuf-dev curl
 
-# Create app user
-RUN addgroup -g 1001 -S appgroup && \
-    adduser -u 1001 -S appuser -G appgroup
+# Create app user (matching docker-compose user: "1000:1000")
+RUN addgroup -g 1000 -S appgroup && \
+    adduser -u 1000 -S appuser -G appgroup
 
 # Set working directory
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /app/main .
-
-# Change ownership
-RUN chown -R appuser:appgroup /app
+# Create cache directories and change ownership
+RUN mkdir -p /go/pkg/mod/cache /go/cache && \
+    chown -R appuser:appgroup /go /app
 
 # Switch to non-root user
 USER appuser
+
+# Install protoc plugins and Air for hot reload as appuser
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.1 && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0 && \
+    go install github.com/cosmtrek/air@v1.49.0
+
+# Set Go environment variables for proper cache handling
+ENV GOCACHE=/go/cache
+ENV GOMODCACHE=/go/pkg/mod
+
+# Copy go mod files
+COPY --chown=appuser:appgroup go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
 
 # Expose ports
 EXPOSE 8080 50051
@@ -51,5 +40,5 @@ EXPOSE 8080 50051
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the application
-CMD ["/app/main"]
+# Development command with Air for hot reload
+CMD ["/go/bin/air", "-c", ".air.toml"]
