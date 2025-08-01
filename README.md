@@ -188,9 +188,9 @@ make migrate
 
 ## 🔄 Integration with Other Services
 
-### Django Core Gateway
+### Core API Gateway
 
-The Django Core Gateway communicates with this service via gRPC for:
+The Core API Gateway communicates with this service via gRPC for:
 - Token validation
 - User authentication
 - Permission checks
@@ -320,4 +320,21 @@ make logs | grep auth-service
 2. Use `make fmt` and `make lint` before committing
 3. Add tests for new features
 4. Update documentation as needed
-5. Test with full stack: `make infra-dev`
+5. Test with full stack: `make start-dev`
+
+
+feat: Redesign of auth service
+
+1. Set up enhanced project structure and core interfaces
+2. Implement high-performance database layer with connection pooling
+3. Build Redis-based caching infrastructure
+4. Create enhanced JWT token service with security features
+5. Build user authentication service with concurrency optimization
+6. Implement permission service with hierarchical RBAC
+7. Build Kafka event publishing system
+8. Create enhanced gRPC server with interceptor chain
+9. Implement core gRPC service methods with performance optimization
+10. Add advanced gRPC methods for user and organization management
+11. Create worker pool system for CPU-intensive operations
+12. Implement comprehensive error handling and recovery
+13. Build extensive unit test suite with high coverage

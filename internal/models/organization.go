@@ -8,15 +8,15 @@ import (
 )
 
 type Organization struct {
-	ID        uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	Name      string    `gorm:"not null;size:255" json:"name" validate:"required,min=2,max=255"`
-	Domain    string    `gorm:"unique;not null;size:255" json:"domain" validate:"required,fqdn"`
-	Settings  Settings  `gorm:"type:jsonb" json:"settings"`
-	IsActive  bool      `gorm:"default:true" json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;index:idx_org_id" json:"id"`
+	Name      string    `gorm:"not null;size:255;index:idx_org_name" json:"name" validate:"required,min=2,max=255"`
+	Domain    string    `gorm:"unique;not null;size:255;index:idx_org_domain" json:"domain" validate:"required,fqdn"`
+	Settings  Settings  `gorm:"type:text" json:"settings"`
+	IsActive  bool      `gorm:"default:true;index:idx_org_active" json:"is_active"`
+	CreatedAt time.Time `gorm:"index:idx_org_created" json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// Relationships
+	// Relationships (lazy loaded for performance)
 	Users []User `gorm:"foreignKey:OrganizationID" json:"users,omitempty"`
 	Roles []Role `gorm:"foreignKey:OrganizationID" json:"roles,omitempty"`
 }

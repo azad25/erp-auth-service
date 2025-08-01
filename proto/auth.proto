@@ -8,6 +8,9 @@ import "google/protobuf/timestamp.proto";
 
 // Auth service definition
 service AuthService {
+  // Authentication operations
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  
   // Token operations
   rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
   rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
@@ -15,7 +18,19 @@ service AuthService {
   
   // User operations
   rpc GetUser(GetUserRequest) returns (GetUserResponse);
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  
+  // Organization operations
+  rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
+  rpc GetOrganization(GetOrganizationRequest) returns (GetOrganizationResponse);
+  
+  // Bulk operations
+  rpc BulkCreateUsers(BulkCreateUsersRequest) returns (BulkCreateUsersResponse);
+  rpc BulkUpdateUsers(BulkUpdateUsersRequest) returns (BulkUpdateUsersResponse);
+  rpc BulkCheckPermissions(BulkCheckPermissionsRequest) returns (BulkCheckPermissionsResponse);
   
   // Health check
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
@@ -80,6 +95,40 @@ message CheckPermissionResponse {
   string error = 2;
 }
 
+// Authentication
+message AuthenticateRequest {
+  string email = 1;
+  string password = 2;
+  string organization_domain = 3;
+  string two_factor_code = 4;
+  SecurityContext security_context = 5;
+  bool remember_me = 6;
+}
+
+message AuthenticateResponse {
+  bool success = 1;
+  TokenPair tokens = 2;
+  User user = 3;
+  bool requires_two_fa = 4;
+  string error = 5;
+  repeated string warnings = 6;
+}
+
+message SecurityContext {
+  string ip_address = 1;
+  string user_agent = 2;
+  string device_fingerprint = 3;
+  string session_id = 4;
+}
+
+message TokenPair {
+  string access_token = 1;
+  string refresh_token = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  google.protobuf.Timestamp refresh_expires_at = 4;
+  string token_type = 5;
+}
+
 // Health check
 message HealthCheckRequest {}
 
@@ -111,4 +160,172 @@ message Organization {
   bool is_active = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+}
+
+// User management messages
+message CreateUserRequest {
+  string organization_id = 1;
+  string email = 2;
+  string password = 3;
+  string first_name = 4;
+  string last_name = 5;
+  bool is_active = 6;
+  bool is_verified = 7;
+  repeated string role_ids = 8;
+  SecurityContext security_context = 9;
+}
+
+message CreateUserResponse {
+  bool success = 1;
+  User user = 2;
+  string error = 3;
+}
+
+message UpdateUserRequest {
+  string user_id = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+  bool is_active = 5;
+  bool is_verified = 6;
+  repeated string role_ids = 7;
+  SecurityContext security_context = 8;
+}
+
+message UpdateUserResponse {
+  bool success = 1;
+  User user = 2;
+  string error = 3;
+}
+
+message ChangePasswordRequest {
+  string user_id = 1;
+  string current_password = 2;
+  string new_password = 3;
+  SecurityContext security_context = 4;
+}
+
+message ChangePasswordResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// Organization management messages
+message CreateOrganizationRequest {
+  string name = 1;
+  string domain = 2;
+  OrganizationSettings settings = 3;
+  string admin_email = 4;
+  string admin_password = 5;
+  string admin_first_name = 6;
+  string admin_last_name = 7;
+  SecurityContext security_context = 8;
+}
+
+message CreateOrganizationResponse {
+  bool success = 1;
+  Organization organization = 2;
+  User admin_user = 3;
+  TokenPair tokens = 4;
+  string error = 5;
+}
+
+message GetOrganizationRequest {
+  string organization_id = 1;
+}
+
+message GetOrganizationResponse {
+  Organization organization = 1;
+  string error = 2;
+}
+
+message OrganizationSettings {
+  string timezone = 1;
+  string date_format = 2;
+  string currency = 3;
+  string language = 4;
+  bool two_factor_enabled = 5;
+  int32 session_timeout = 6;
+  map<string, string> custom_fields = 7;
+}
+
+// Bulk operation messages
+message BulkCreateUsersRequest {
+  string organization_id = 1;
+  repeated CreateUserData users = 2;
+  SecurityContext security_context = 3;
+}
+
+message CreateUserData {
+  string email = 1;
+  string password = 2;
+  string first_name = 3;
+  string last_name = 4;
+  bool is_active = 5;
+  bool is_verified = 6;
+  repeated string role_ids = 7;
+}
+
+message BulkCreateUsersResponse {
+  bool success = 1;
+  repeated BulkUserResult results = 2;
+  int32 created_count = 3;
+  int32 failed_count = 4;
+  string error = 5;
+}
+
+message BulkUserResult {
+  bool success = 1;
+  User user = 2;
+  string error = 3;
+  string email = 4; // For identification in case of error
+}
+
+message BulkUpdateUsersRequest {
+  repeated UpdateUserData users = 1;
+  SecurityContext security_context = 2;
+}
+
+message UpdateUserData {
+  string user_id = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+  bool is_active = 5;
+  bool is_verified = 6;
+  repeated string role_ids = 7;
+}
+
+message BulkUpdateUsersResponse {
+  bool success = 1;
+  repeated BulkUserResult results = 2;
+  int32 updated_count = 3;
+  int32 failed_count = 4;
+  string error = 5;
+}
+
+message BulkCheckPermissionsRequest {
+  repeated PermissionCheck checks = 1;
+}
+
+message PermissionCheck {
+  string user_id = 1;
+  string resource = 2;
+  string action = 3;
+  string scope = 4;
+}
+
+message BulkCheckPermissionsResponse {
+  bool success = 1;
+  repeated PermissionResult results = 2;
+  string error = 3;
+}
+
+message PermissionResult {
+  bool has_permission = 1;
+  string user_id = 2;
+  string resource = 3;
+  string action = 4;
+  string scope = 5;
+  string error = 6;
 }

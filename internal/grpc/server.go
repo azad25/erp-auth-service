@@ -3,69 +3,294 @@ package grpc
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
+	"erp-auth-service/internal/application/services"
+	"erp-auth-service/internal/cache"
 	"erp-auth-service/internal/config"
+	"erp-auth-service/internal/domain/entities"
+	"erp-auth-service/internal/errors"
+	"erp-auth-service/internal/grpc/interceptors"
 	"erp-auth-service/internal/middleware"
 	"erp-auth-service/internal/models"
-	pb "erp-auth-service/auth"
+	pb "erp-auth-service/proto"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+	"github.com/sony/gobreaker"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/gorm"
 )
 
-type AuthGRPCServer struct {
+// EnhancedAuthGRPCServer represents the enhanced gRPC server with interceptor chain
+type EnhancedAuthGRPCServer struct {
 	pb.UnimplementedAuthServiceServer
+	
+	// Dependencies
 	db          *gorm.DB
 	redisClient *redis.Client
 	config      *config.Config
+	logger      *zap.Logger
+	
+	// Business services
+	authService       *services.AuthService
+	tokenService      *services.TokenService
+	permissionService *services.PermissionService
+	cacheManager      cache.CacheManager
+	
+	// Server components
+	grpcServer    *grpc.Server
+	listener      net.Listener
+	
+	// Interceptors and middleware
+	rateLimiter           *interceptors.RateLimiter
+	circuitBreakerManager *interceptors.CircuitBreakerManager
+	metricsInterceptor    *interceptors.MetricsInterceptor
+	loggingInterceptor    *interceptors.LoggingInterceptor
+	authInterceptor       *interceptors.AuthInterceptor
+	recoveryInterceptor   *interceptors.RecoveryInterceptor
+	
+	// Error handling
+	errorHandler *errors.ErrorHandler
+	
+	// Metrics registry
+	metricsRegistry *prometheus.Registry
+	
+	// Shutdown coordination
+	shutdownCh chan struct{}
+	wg         sync.WaitGroup
 }
 
-func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Config) *AuthGRPCServer {
-	return &AuthGRPCServer{
-		db:          db,
-		redisClient: redisClient,
-		config:      config,
+// NewEnhancedAuthGRPCServer creates a new enhanced gRPC server
+func NewEnhancedAuthGRPCServer(
+	db *gorm.DB, 
+	redisClient *redis.Client, 
+	config *config.Config, 
+	logger *zap.Logger,
+	authService *services.AuthService,
+	tokenService *services.TokenService,
+	permissionService *services.PermissionService,
+	cacheManager cache.CacheManager,
+) *EnhancedAuthGRPCServer {
+	// Create metrics registry
+	metricsRegistry := prometheus.NewRegistry()
+	
+	// Initialize interceptors
+	rateLimiterConfig := interceptors.RateLimiterConfig{
+		RequestsPerSecond: 1000, // 1000 RPS per client
+		BurstSize:         100,
+		WindowSize:        time.Minute,
+		RedisKeyPrefix:    "ratelimit",
 	}
+	
+	server := &EnhancedAuthGRPCServer{
+		db:              db,
+		redisClient:     redisClient,
+		config:          config,
+		logger:          logger,
+		metricsRegistry: metricsRegistry,
+		shutdownCh:      make(chan struct{}),
+		
+		// Business services
+		authService:       authService,
+		tokenService:      tokenService,
+		permissionService: permissionService,
+		cacheManager:      cacheManager,
+		
+		// Initialize interceptors
+		rateLimiter:           interceptors.NewRateLimiter(redisClient, rateLimiterConfig, logger),
+		circuitBreakerManager: interceptors.NewCircuitBreakerManager(logger),
+		metricsInterceptor:    interceptors.NewMetricsInterceptor(metricsRegistry),
+		loggingInterceptor:    interceptors.NewLoggingInterceptor(logger),
+		authInterceptor:       interceptors.NewAuthInterceptor(config.JWT.Secret, "internal-service-key", logger),
+		recoveryInterceptor:   interceptors.NewRecoveryInterceptor(logger),
+	}
+	
+	// Initialize comprehensive error handler
+	server.errorHandler = errors.NewErrorHandler(logger, errors.GetDefaultErrorHandlerConfig())
+	
+	// Register circuit breakers for dependencies
+	server.setupCircuitBreakers()
+	
+	return server
 }
 
-func (s *AuthGRPCServer) Start(port string) error {
-	lis, err := net.Listen("tcp", ":"+port)
+// setupCircuitBreakers configures circuit breakers for external dependencies
+func (s *EnhancedAuthGRPCServer) setupCircuitBreakers() {
+	// Database circuit breaker
+	s.circuitBreakerManager.RegisterBreaker("database", interceptors.GetDefaultDatabaseConfig())
+	
+	// Redis circuit breaker
+	s.circuitBreakerManager.RegisterBreaker("redis", interceptors.GetDefaultRedisConfig())
+	
+	// Kafka circuit breaker (if needed)
+	s.circuitBreakerManager.RegisterBreaker("kafka", interceptors.GetDefaultKafkaConfig())
+	
+	// gRPC handler circuit breaker
+	s.circuitBreakerManager.RegisterBreaker("grpc-handler", interceptors.CircuitBreakerConfig{
+		MaxRequests: 10,
+		Interval:    time.Second * 30,
+		Timeout:     time.Second * 60,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 10 && failureRatio >= 0.3
+		},
+	})
+}
+
+// Start starts the enhanced gRPC server with graceful shutdown
+func (s *EnhancedAuthGRPCServer) Start() error {
+	// Create listener
+	lis, err := net.Listen("tcp", ":"+s.config.GRPC.Port)
 	if err != nil {
-		return fmt.Errorf("failed to listen on port %s: %w", port, err)
+		return fmt.Errorf("failed to listen on port %s: %w", s.config.GRPC.Port, err)
 	}
-
-	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(s.loggingInterceptor),
+	s.listener = lis
+	
+	// Create gRPC server with enhanced configuration
+	s.grpcServer = grpc.NewServer(
+		// Connection settings
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle:     time.Duration(s.config.GRPC.MaxConnectionIdle) * time.Second,
+			MaxConnectionAge:      time.Duration(s.config.GRPC.MaxConnectionAge) * time.Second,
+			MaxConnectionAgeGrace: time.Duration(s.config.GRPC.MaxConnectionAgeGrace) * time.Second,
+			Time:                  time.Duration(s.config.GRPC.Time) * time.Second,
+			Timeout:               time.Duration(s.config.GRPC.Timeout) * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             time.Duration(s.config.GRPC.KeepaliveEnforcementMinTime) * time.Second,
+			PermitWithoutStream: s.config.GRPC.KeepaliveEnforcementPermitWithoutStream,
+		}),
+		
+		// Message size limits
+		grpc.MaxRecvMsgSize(s.config.GRPC.MaxRecvMsgSize),
+		grpc.MaxSendMsgSize(s.config.GRPC.MaxSendMsgSize),
+		grpc.MaxConcurrentStreams(uint32(s.config.GRPC.MaxConcurrentStreams)),
+		
+		// Interceptor chain - order matters!
+		grpc.ChainUnaryInterceptor(
+			s.recoveryInterceptor.UnaryServerInterceptor(),     // First: catch panics
+			s.loggingInterceptor.UnaryServerInterceptor(),      // Second: log requests
+			s.metricsInterceptor.UnaryServerInterceptor(),      // Third: collect metrics
+			s.rateLimiter.UnaryServerInterceptor(),             // Fourth: rate limiting
+			s.authInterceptor.UnaryServerInterceptor(),         // Fifth: authentication
+			s.circuitBreakerManager.UnaryServerInterceptor(),   // Sixth: circuit breaker
+		),
+		grpc.ChainStreamInterceptor(
+			s.recoveryInterceptor.StreamServerInterceptor(),
+			s.loggingInterceptor.StreamServerInterceptor(),
+			s.metricsInterceptor.StreamServerInterceptor(),
+			s.rateLimiter.StreamServerInterceptor(),
+			s.authInterceptor.StreamServerInterceptor(),
+			s.circuitBreakerManager.StreamServerInterceptor(),
+		),
 	)
-
-	pb.RegisterAuthServiceServer(grpcServer, s)
-
-	log.Printf("gRPC server starting on port %s", port)
-	return grpcServer.Serve(lis)
+	
+	// Register service
+	pb.RegisterAuthServiceServer(s.grpcServer, s)
+	
+	// Start server in goroutine
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.logger.Info("Enhanced gRPC server starting",
+			zap.String("port", s.config.GRPC.Port),
+			zap.Int("max_concurrent_streams", s.config.GRPC.MaxConcurrentStreams),
+			zap.Int("max_recv_msg_size", s.config.GRPC.MaxRecvMsgSize),
+			zap.Int("max_send_msg_size", s.config.GRPC.MaxSendMsgSize))
+		
+		if err := s.grpcServer.Serve(lis); err != nil {
+			s.logger.Error("gRPC server error", zap.Error(err))
+		}
+	}()
+	
+	// Setup graceful shutdown
+	s.setupGracefulShutdown()
+	
+	return nil
 }
 
-func (s *AuthGRPCServer) loggingInterceptor(
-	ctx context.Context,
-	req interface{},
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (interface{}, error) {
+// setupGracefulShutdown configures graceful shutdown handling
+func (s *EnhancedAuthGRPCServer) setupGracefulShutdown() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	
+	go func() {
+		sig := <-sigCh
+		s.logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
+		s.Shutdown()
+	}()
+}
+
+// Shutdown gracefully shuts down the server
+func (s *EnhancedAuthGRPCServer) Shutdown() {
+	s.logger.Info("Starting graceful shutdown...")
+	
+	// Close shutdown channel to signal shutdown
+	close(s.shutdownCh)
+	
+	// Create shutdown context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	// Graceful stop with timeout
+	done := make(chan struct{})
+	go func() {
+		s.grpcServer.GracefulStop()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		s.logger.Info("gRPC server stopped gracefully")
+	case <-ctx.Done():
+		s.logger.Warn("Graceful shutdown timeout, forcing stop")
+		s.grpcServer.Stop()
+	}
+	
+	// Wait for all goroutines to finish
+	s.wg.Wait()
+	s.logger.Info("Enhanced gRPC server shutdown complete")
+}
+
+// Wait blocks until the server shuts down
+func (s *EnhancedAuthGRPCServer) Wait() {
+	<-s.shutdownCh
+	s.wg.Wait()
+}
+
+// GetMetricsRegistry returns the Prometheus metrics registry
+func (s *EnhancedAuthGRPCServer) GetMetricsRegistry() *prometheus.Registry {
+	return s.metricsRegistry
+}
+
+// ValidateToken validates a JWT token with sub-10ms response time optimization
+func (s *EnhancedAuthGRPCServer) ValidateToken(ctx context.Context, req *pb.ValidateTokenRequest) (*pb.ValidateTokenResponse, error) {
+	// Start performance timer
 	start := time.Now()
-	resp, err := handler(ctx, req)
-	duration := time.Since(start)
+	defer func() {
+		duration := time.Since(start)
+		if s.metricsInterceptor != nil {
+			s.metricsInterceptor.RecordTokenValidationDuration(duration)
+		}
+		if duration > 10*time.Millisecond {
+			s.logger.Warn("Token validation exceeded 10ms target", 
+				zap.Duration("duration", duration),
+				zap.String("token_prefix", req.Token[:min(len(req.Token), 20)]))
+		}
+	}()
 
-	log.Printf("gRPC call: %s, duration: %v, error: %v", info.FullMethod, duration, err)
-	return resp, err
-}
-
-func (s *AuthGRPCServer) ValidateToken(ctx context.Context, req *pb.ValidateTokenRequest) (*pb.ValidateTokenResponse, error) {
 	if req.Token == "" {
 		return &pb.ValidateTokenResponse{
 			Valid: false,
@@ -73,33 +298,14 @@ func (s *AuthGRPCServer) ValidateToken(ctx context.Context, req *pb.ValidateToke
 		}, nil
 	}
 
-	// Parse and validate JWT token
-	claims := &middleware.Claims{}
-	token, err := jwt.ParseWithClaims(req.Token, claims, func(token *jwt.Token) (interface{}, error) {
-		return []byte(s.config.JWT.Secret), nil
-	})
-
-	if err != nil || !token.Valid {
+	// Use token service for optimized validation with caching
+	tokenService := s.getTokenService()
+	claims, err := tokenService.ValidateToken(ctx, req.Token)
+	if err != nil {
+		s.logger.Debug("Token validation failed", zap.Error(err))
 		return &pb.ValidateTokenResponse{
 			Valid: false,
-			Error: "Invalid token",
-		}, nil
-	}
-
-	// Check if token is blacklisted
-	if s.redisClient.Get(ctx, "blacklist:"+req.Token).Err() == nil {
-		return &pb.ValidateTokenResponse{
-			Valid: false,
-			Error: "Token is blacklisted",
-		}, nil
-	}
-
-	// Verify user still exists and is active
-	var user models.User
-	if err := s.db.Where("id = ? AND is_active = true", claims.UserID).First(&user).Error; err != nil {
-		return &pb.ValidateTokenResponse{
-			Valid: false,
-			Error: "User not found or inactive",
+			Error: "Invalid or expired token",
 		}, nil
 	}
 
@@ -112,59 +318,40 @@ func (s *AuthGRPCServer) ValidateToken(ctx context.Context, req *pb.ValidateToke
 	}, nil
 }
 
-func (s *AuthGRPCServer) RefreshToken(ctx context.Context, req *pb.RefreshTokenRequest) (*pb.RefreshTokenResponse, error) {
+// RefreshToken creates new tokens with atomic operations
+func (s *EnhancedAuthGRPCServer) RefreshToken(ctx context.Context, req *pb.RefreshTokenRequest) (*pb.RefreshTokenResponse, error) {
 	if req.RefreshToken == "" {
 		return &pb.RefreshTokenResponse{
 			Error: "Refresh token is required",
 		}, nil
 	}
 
-	// Parse refresh token
-	claims := &middleware.Claims{}
-	token, err := jwt.ParseWithClaims(req.RefreshToken, claims, func(token *jwt.Token) (interface{}, error) {
-		return []byte(s.config.JWT.Secret), nil
-	})
-
-	if err != nil || !token.Valid {
-		return &pb.RefreshTokenResponse{
-			Error: "Invalid refresh token",
-		}, nil
+	// Use token service for atomic refresh operation
+	tokenService := s.getTokenService()
+	
+	// Create security context from request metadata if available
+	securityCtx := &services.SecurityContext{
+		IPAddress: "unknown", // Extract from gRPC metadata if needed
+		UserAgent: "grpc-client",
 	}
-
-	// Check if refresh token is blacklisted
-	if s.redisClient.Get(ctx, "blacklist:"+req.RefreshToken).Err() == nil {
-		return &pb.RefreshTokenResponse{
-			Error: "Refresh token is blacklisted",
-		}, nil
-	}
-
-	// Find user
-	var user models.User
-	if err := s.db.Where("id = ? AND is_active = true", claims.UserID).First(&user).Error; err != nil {
-		return &pb.RefreshTokenResponse{
-			Error: "User not found or inactive",
-		}, nil
-	}
-
-	// Generate new tokens
-	accessToken, newRefreshToken, err := s.generateTokens(user)
+	
+	tokenPair, err := tokenService.RefreshToken(ctx, req.RefreshToken, securityCtx)
 	if err != nil {
+		s.logger.Debug("Token refresh failed", zap.Error(err))
 		return &pb.RefreshTokenResponse{
-			Error: "Failed to generate tokens",
+			Error: "Invalid or expired refresh token",
 		}, nil
 	}
-
-	// Blacklist old refresh token
-	s.redisClient.Set(ctx, "blacklist:"+req.RefreshToken, "1", time.Duration(s.config.JWT.RefreshExpiry)*time.Second)
 
 	return &pb.RefreshTokenResponse{
-		AccessToken:  accessToken,
-		RefreshToken: newRefreshToken,
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
 		ExpiresIn:    int32(s.config.JWT.AccessExpiry),
 	}, nil
 }
 
-func (s *AuthGRPCServer) RevokeToken(ctx context.Context, req *pb.RevokeTokenRequest) (*pb.RevokeTokenResponse, error) {
+// RevokeToken revokes a token with atomic operations
+func (s *EnhancedAuthGRPCServer) RevokeToken(ctx context.Context, req *pb.RevokeTokenRequest) (*pb.RevokeTokenResponse, error) {
 	if req.Token == "" {
 		return &pb.RevokeTokenResponse{
 			Success: false,
@@ -172,16 +359,11 @@ func (s *AuthGRPCServer) RevokeToken(ctx context.Context, req *pb.RevokeTokenReq
 		}, nil
 	}
 
-	// Add token to blacklist
-	var expiry time.Duration
-	if req.TokenType == "refresh" {
-		expiry = time.Duration(s.config.JWT.RefreshExpiry) * time.Second
-	} else {
-		expiry = time.Duration(s.config.JWT.AccessExpiry) * time.Second
-	}
-
-	err := s.redisClient.Set(ctx, "blacklist:"+req.Token, "1", expiry).Err()
+	// Use token service for atomic revocation
+	tokenService := s.getTokenService()
+	err := tokenService.RevokeToken(ctx, req.Token)
 	if err != nil {
+		s.logger.Debug("Token revocation failed", zap.Error(err))
 		return &pb.RevokeTokenResponse{
 			Success: false,
 			Error:   "Failed to revoke token",
@@ -193,7 +375,8 @@ func (s *AuthGRPCServer) RevokeToken(ctx context.Context, req *pb.RevokeTokenReq
 	}, nil
 }
 
-func (s *AuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.GetUserResponse, error) {
+// GetUser retrieves user with preloaded relationships and caching
+func (s *EnhancedAuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.GetUserResponse, error) {
 	if req.UserId == "" {
 		return &pb.GetUserResponse{
 			Error: "User ID is required",
@@ -207,37 +390,40 @@ func (s *AuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (*
 		}, nil
 	}
 
+	// Try cache first for performance optimization
+	cacheKey := fmt.Sprintf("user:full:%s", userID.String())
+	if cachedData, err := s.cacheManager.Get(ctx, cacheKey); err == nil {
+		// Deserialize cached user data
+		var cachedUser pb.User
+		if err := s.deserializeUser(cachedData, &cachedUser); err == nil {
+			s.logger.Debug("User cache hit", zap.String("user_id", userID.String()))
+			return &pb.GetUserResponse{User: &cachedUser}, nil
+		}
+	}
+
+	// Cache miss - fetch from database with preloaded relationships
 	var user models.User
-	if err := s.db.Preload("Organization").Where("id = ?", userID).First(&user).Error; err != nil {
+	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
+		return nil, s.db.Preload("Organization").
+			Preload("UserRoles").
+			Preload("UserRoles.Role").
+			Where("id = ?", userID).First(&user).Error
+	})
+	
+	if err != nil {
+		s.logger.Error("Database user lookup failed", zap.Error(err), zap.String("user_id", userID.String()))
 		return &pb.GetUserResponse{
 			Error: "User not found",
 		}, nil
 	}
 
-	pbUser := &pb.User{
-		Id:             user.ID.String(),
-		OrganizationId: user.OrganizationID.String(),
-		Email:          user.Email,
-		FirstName:      user.FirstName,
-		LastName:       user.LastName,
-		IsActive:       user.IsActive,
-		IsVerified:     user.IsVerified,
-		CreatedAt:      timestamppb.New(user.CreatedAt),
-		UpdatedAt:      timestamppb.New(user.UpdatedAt),
-	}
+	// Convert to protobuf with all relationships
+	pbUser := s.convertUserToProto(&user)
 
-	if user.LastLoginAt != nil {
-		pbUser.LastLoginAt = timestamppb.New(*user.LastLoginAt)
-	}
-
-	if user.Organization.ID != uuid.Nil {
-		pbUser.Organization = &pb.Organization{
-			Id:        user.Organization.ID.String(),
-			Name:      user.Organization.Name,
-			Domain:    user.Organization.Domain,
-			IsActive:  user.Organization.IsActive,
-			CreatedAt: timestamppb.New(user.Organization.CreatedAt),
-			UpdatedAt: timestamppb.New(user.Organization.UpdatedAt),
+	// Cache the result for future requests (5 minute TTL)
+	if serializedUser, err := s.serializeUser(pbUser); err == nil {
+		if err := s.cacheManager.Set(ctx, cacheKey, serializedUser, 5*time.Minute); err != nil {
+			s.logger.Warn("Failed to cache user data", zap.Error(err))
 		}
 	}
 
@@ -246,7 +432,8 @@ func (s *AuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (*
 	}, nil
 }
 
-func (s *AuthGRPCServer) CheckPermission(ctx context.Context, req *pb.CheckPermissionRequest) (*pb.CheckPermissionResponse, error) {
+// CheckPermission checks user permissions with intelligent caching strategies
+func (s *EnhancedAuthGRPCServer) CheckPermission(ctx context.Context, req *pb.CheckPermissionRequest) (*pb.CheckPermissionResponse, error) {
 	if req.UserId == "" || req.Resource == "" || req.Action == "" {
 		return &pb.CheckPermissionResponse{
 			HasPermission: false,
@@ -262,30 +449,18 @@ func (s *AuthGRPCServer) CheckPermission(ctx context.Context, req *pb.CheckPermi
 		}, nil
 	}
 
-	// Get user roles with permissions
-	var userRoles []models.UserRole
-	if err := s.db.Preload("Role.RolePermissions.Permission").Where("user_id = ?", userID).Find(&userRoles).Error; err != nil {
+	// Use permission service with intelligent caching
+	permissionService := s.getPermissionService()
+	hasPermission, err := permissionService.CheckUserPermissionWithScope(ctx, userID, req.Resource, req.Action, "")
+	if err != nil {
+		s.logger.Error("Permission check failed", zap.Error(err), 
+			zap.String("user_id", userID.String()),
+			zap.String("resource", req.Resource),
+			zap.String("action", req.Action))
 		return &pb.CheckPermissionResponse{
 			HasPermission: false,
-			Error:         "Failed to fetch user roles",
+			Error:         "Failed to check permission",
 		}, nil
-	}
-
-	// Check if user has the required permission
-	hasPermission := false
-	for _, userRole := range userRoles {
-		if !userRole.Role.IsActive {
-			continue
-		}
-		for _, rolePermission := range userRole.Role.RolePermissions {
-			if rolePermission.Permission.Resource == req.Resource && rolePermission.Permission.Action == req.Action {
-				hasPermission = true
-				break
-			}
-		}
-		if hasPermission {
-			break
-		}
 	}
 
 	return &pb.CheckPermissionResponse{
@@ -293,7 +468,502 @@ func (s *AuthGRPCServer) CheckPermission(ctx context.Context, req *pb.CheckPermi
 	}, nil
 }
 
-func (s *AuthGRPCServer) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
+// Note: Authenticate method will be implemented once protobuf files are regenerated
+// For now, focusing on the existing methods that work with current proto definitions
+
+// CreateUser implements CreateUser method with transaction management
+func (s *EnhancedAuthGRPCServer) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.CreateUserResponse, error) {
+	// Validate input
+	if req.Email == "" || req.Password == "" || req.FirstName == "" || req.LastName == "" {
+		return &pb.CreateUserResponse{
+			Success: false,
+			Error:   "Email, password, first name, and last name are required",
+		}, nil
+	}
+
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.CreateUserResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	// Create security context
+	securityCtx := &services.SecurityContext{
+		IPAddress: "grpc-client", // Extract from metadata if available
+		UserAgent: "grpc-client",
+	}
+	if req.SecurityContext != nil {
+		securityCtx.IPAddress = req.SecurityContext.IpAddress
+		securityCtx.UserAgent = req.SecurityContext.UserAgent
+	}
+
+	// Create registration request
+	regReq := &services.RegistrationRequest{
+		Email:            req.Email,
+		Password:         req.Password,
+		FirstName:        req.FirstName,
+		LastName:         req.LastName,
+		SecurityContext:  securityCtx,
+	}
+
+	// For existing organization, we need a different method
+	user, err := s.createUserInExistingOrganization(ctx, orgID, regReq)
+	if err != nil {
+		s.logger.Error("Failed to create user", zap.Error(err))
+		return &pb.CreateUserResponse{
+			Success: false,
+			Error:   "Failed to create user: " + err.Error(),
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbUser := s.convertUserToProto(user)
+
+	// Invalidate relevant caches
+	s.invalidateUserCaches(ctx, user.ID, user.OrganizationID)
+
+	return &pb.CreateUserResponse{
+		Success: true,
+		User:    pbUser,
+	}, nil
+}
+
+// UpdateUser implements UpdateUser method with cache invalidation
+func (s *EnhancedAuthGRPCServer) UpdateUser(ctx context.Context, req *pb.UpdateUserRequest) (*pb.UpdateUserResponse, error) {
+	// Validate input
+	if req.UserId == "" {
+		return &pb.UpdateUserResponse{
+			Success: false,
+			Error:   "User ID is required",
+		}, nil
+	}
+
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.UpdateUserResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	// Get existing user
+	var user models.User
+	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
+		return nil, s.db.Where("id = ?", userID).First(&user).Error
+	})
+	
+	if err != nil {
+		return &pb.UpdateUserResponse{
+			Success: false,
+			Error:   "User not found",
+		}, nil
+	}
+
+	// Update fields if provided
+	if req.Email != "" {
+		user.Email = req.Email
+	}
+	if req.FirstName != "" {
+		user.FirstName = req.FirstName
+	}
+	if req.LastName != "" {
+		user.LastName = req.LastName
+	}
+	user.IsActive = req.IsActive
+	user.IsVerified = req.IsVerified
+	user.UpdatedAt = time.Now()
+
+	// Update user in database with transaction
+	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
+		return nil, s.db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Save(&user).Error; err != nil {
+				return err
+			}
+
+			// Update role assignments if provided
+			if len(req.RoleIds) > 0 {
+				// Remove existing roles
+				if err := tx.Where("user_id = ?", userID).Delete(&models.UserRole{}).Error; err != nil {
+					return err
+				}
+
+				// Add new roles
+				for _, roleIDStr := range req.RoleIds {
+					roleID, err := uuid.Parse(roleIDStr)
+					if err != nil {
+						continue // Skip invalid role IDs
+					}
+					
+					userRole := models.UserRole{
+						UserID: userID,
+						RoleID: roleID,
+					}
+					if err := tx.Create(&userRole).Error; err != nil {
+						return err
+					}
+				}
+			}
+
+			return nil
+		})
+	})
+
+	if err != nil {
+		s.logger.Error("Failed to update user", zap.Error(err))
+		return &pb.UpdateUserResponse{
+			Success: false,
+			Error:   "Failed to update user",
+		}, nil
+	}
+
+	// Invalidate caches
+	s.invalidateUserCaches(ctx, user.ID, user.OrganizationID)
+
+	// Publish user updated event
+	s.publishUserUpdatedEvent(ctx, &user, req.SecurityContext)
+
+	// Convert to protobuf
+	pbUser := s.convertUserToProto(&user)
+
+	return &pb.UpdateUserResponse{
+		Success: true,
+		User:    pbUser,
+	}, nil
+}
+
+// ChangePassword implements ChangePassword method with security event publishing
+func (s *EnhancedAuthGRPCServer) ChangePassword(ctx context.Context, req *pb.ChangePasswordRequest) (*pb.ChangePasswordResponse, error) {
+	// Validate input
+	if req.UserId == "" || req.CurrentPassword == "" || req.NewPassword == "" {
+		return &pb.ChangePasswordResponse{
+			Success: false,
+			Error:   "User ID, current password, and new password are required",
+		}, nil
+	}
+
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.ChangePasswordResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	// Create security context
+	securityCtx := &services.SecurityContext{
+		IPAddress: "grpc-client",
+		UserAgent: "grpc-client",
+	}
+	if req.SecurityContext != nil {
+		securityCtx.IPAddress = req.SecurityContext.IpAddress
+		securityCtx.UserAgent = req.SecurityContext.UserAgent
+	}
+
+	// Use auth service to change password
+	authService := s.getAuthService()
+	changeReq := &services.PasswordChangeRequest{
+		UserID:          userID,
+		CurrentPassword: req.CurrentPassword,
+		NewPassword:     req.NewPassword,
+		SecurityContext: securityCtx,
+	}
+
+	if err := authService.ChangePassword(ctx, changeReq); err != nil {
+		s.logger.Error("Failed to change password", zap.Error(err))
+		return &pb.ChangePasswordResponse{
+			Success: false,
+			Error:   "Failed to change password: " + err.Error(),
+		}, nil
+	}
+
+	return &pb.ChangePasswordResponse{
+		Success: true,
+	}, nil
+}
+
+// CreateOrganization implements CreateOrganization method with initial role setup
+func (s *EnhancedAuthGRPCServer) CreateOrganization(ctx context.Context, req *pb.CreateOrganizationRequest) (*pb.CreateOrganizationResponse, error) {
+	// Validate input
+	if req.Name == "" || req.Domain == "" || req.AdminEmail == "" || req.AdminPassword == "" {
+		return &pb.CreateOrganizationResponse{
+			Success: false,
+			Error:   "Name, domain, admin email, and admin password are required",
+		}, nil
+	}
+
+	// Create security context
+	securityCtx := &services.SecurityContext{
+		IPAddress: "grpc-client",
+		UserAgent: "grpc-client",
+	}
+	if req.SecurityContext != nil {
+		securityCtx.IPAddress = req.SecurityContext.IpAddress
+		securityCtx.UserAgent = req.SecurityContext.UserAgent
+	}
+
+	// Use auth service to register organization with admin user
+	authService := s.getAuthService()
+	regReq := &services.RegistrationRequest{
+		Email:              req.AdminEmail,
+		Password:           req.AdminPassword,
+		FirstName:          req.AdminFirstName,
+		LastName:           req.AdminLastName,
+		OrganizationName:   req.Name,
+		OrganizationDomain: req.Domain,
+		SecurityContext:    securityCtx,
+	}
+
+	regResp, err := authService.Register(ctx, regReq)
+	if err != nil {
+		s.logger.Error("Failed to create organization", zap.Error(err))
+		return &pb.CreateOrganizationResponse{
+			Success: false,
+			Error:   "Failed to create organization: " + err.Error(),
+		}, nil
+	}
+
+	if !regResp.Success {
+		return &pb.CreateOrganizationResponse{
+			Success: false,
+			Error:   regResp.Error,
+		}, nil
+	}
+
+	// Get organization details
+	var org models.Organization
+	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
+		return nil, s.db.Where("id = ?", regResp.User.OrganizationID).First(&org).Error
+	})
+
+	if err != nil {
+		s.logger.Error("Failed to get created organization", zap.Error(err))
+		return &pb.CreateOrganizationResponse{
+			Success: false,
+			Error:   "Failed to retrieve created organization",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbOrg := s.convertOrganizationToProto(&org)
+	pbUser := s.convertEntityUserToProto(regResp.User)
+	pbTokens := s.convertEntityTokenPairToProto(regResp.TokenPair)
+
+	return &pb.CreateOrganizationResponse{
+		Success:      true,
+		Organization: pbOrg,
+		AdminUser:    pbUser,
+		Tokens:       pbTokens,
+	}, nil
+}
+
+// GetOrganization implements GetOrganization method
+func (s *EnhancedAuthGRPCServer) GetOrganization(ctx context.Context, req *pb.GetOrganizationRequest) (*pb.GetOrganizationResponse, error) {
+	if req.OrganizationId == "" {
+		return &pb.GetOrganizationResponse{
+			Error: "Organization ID is required",
+		}, nil
+	}
+
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.GetOrganizationResponse{
+			Error: "Invalid organization ID format",
+		}, nil
+	}
+
+	// Try cache first
+	cacheKey := fmt.Sprintf("org:id:%s", orgID.String())
+	if cachedData, err := s.cacheManager.Get(ctx, cacheKey); err == nil {
+		var cachedOrg pb.Organization
+		if err := s.deserializeOrganization(cachedData, &cachedOrg); err == nil {
+			return &pb.GetOrganizationResponse{Organization: &cachedOrg}, nil
+		}
+	}
+
+	// Get from database
+	var org models.Organization
+	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
+		return nil, s.db.Where("id = ?", orgID).First(&org).Error
+	})
+
+	if err != nil {
+		return &pb.GetOrganizationResponse{
+			Error: "Organization not found",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbOrg := s.convertOrganizationToProto(&org)
+
+	// Cache the result
+	if serializedOrg, err := s.serializeOrganization(pbOrg); err == nil {
+		s.cacheManager.Set(ctx, cacheKey, serializedOrg, time.Hour)
+	}
+
+	return &pb.GetOrganizationResponse{
+		Organization: pbOrg,
+	}, nil
+}
+
+// BulkCreateUsers implements bulk user creation for high-throughput scenarios
+func (s *EnhancedAuthGRPCServer) BulkCreateUsers(ctx context.Context, req *pb.BulkCreateUsersRequest) (*pb.BulkCreateUsersResponse, error) {
+	if req.OrganizationId == "" || len(req.Users) == 0 {
+		return &pb.BulkCreateUsersResponse{
+			Success: false,
+			Error:   "Organization ID and users list are required",
+		}, nil
+	}
+
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.BulkCreateUsersResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	results := make([]*pb.BulkUserResult, len(req.Users))
+	createdCount := int32(0)
+	failedCount := int32(0)
+
+	// Process users in batches for better performance
+	batchSize := 10
+	for i := 0; i < len(req.Users); i += batchSize {
+		end := i + batchSize
+		if end > len(req.Users) {
+			end = len(req.Users)
+		}
+
+		batch := req.Users[i:end]
+		batchResults := s.processBulkUserCreation(ctx, orgID, batch, i)
+		
+		for j, result := range batchResults {
+			results[i+j] = result
+			if result.Success {
+				createdCount++
+			} else {
+				failedCount++
+			}
+		}
+	}
+
+	return &pb.BulkCreateUsersResponse{
+		Success:      createdCount > 0,
+		Results:      results,
+		CreatedCount: createdCount,
+		FailedCount:  failedCount,
+	}, nil
+}
+
+// BulkUpdateUsers implements bulk user updates for high-throughput scenarios
+func (s *EnhancedAuthGRPCServer) BulkUpdateUsers(ctx context.Context, req *pb.BulkUpdateUsersRequest) (*pb.BulkUpdateUsersResponse, error) {
+	if len(req.Users) == 0 {
+		return &pb.BulkUpdateUsersResponse{
+			Success: false,
+			Error:   "Users list is required",
+		}, nil
+	}
+
+	results := make([]*pb.BulkUserResult, len(req.Users))
+	updatedCount := int32(0)
+	failedCount := int32(0)
+
+	// Process users in batches
+	batchSize := 10
+	for i := 0; i < len(req.Users); i += batchSize {
+		end := i + batchSize
+		if end > len(req.Users) {
+			end = len(req.Users)
+		}
+
+		batch := req.Users[i:end]
+		batchResults := s.processBulkUserUpdate(ctx, batch, i)
+		
+		for j, result := range batchResults {
+			results[i+j] = result
+			if result.Success {
+				updatedCount++
+			} else {
+				failedCount++
+			}
+		}
+	}
+
+	return &pb.BulkUpdateUsersResponse{
+		Success:      updatedCount > 0,
+		Results:      results,
+		UpdatedCount: updatedCount,
+		FailedCount:  failedCount,
+	}, nil
+}
+
+// BulkCheckPermissions implements bulk permission checking for high-throughput scenarios
+func (s *EnhancedAuthGRPCServer) BulkCheckPermissions(ctx context.Context, req *pb.BulkCheckPermissionsRequest) (*pb.BulkCheckPermissionsResponse, error) {
+	if len(req.Checks) == 0 {
+		return &pb.BulkCheckPermissionsResponse{
+			Success: false,
+			Error:   "Permission checks list is required",
+		}, nil
+	}
+
+	results := make([]*pb.PermissionResult, len(req.Checks))
+	permissionService := s.getPermissionService()
+
+	// Process permission checks concurrently for better performance
+	type checkResult struct {
+		index  int
+		result *pb.PermissionResult
+	}
+
+	resultChan := make(chan checkResult, len(req.Checks))
+	semaphore := make(chan struct{}, 20) // Limit concurrent checks
+
+	for i, check := range req.Checks {
+		go func(idx int, permCheck *pb.PermissionCheck) {
+			semaphore <- struct{}{} // Acquire semaphore
+			defer func() { <-semaphore }() // Release semaphore
+
+			result := &pb.PermissionResult{
+				UserId:   permCheck.UserId,
+				Resource: permCheck.Resource,
+				Action:   permCheck.Action,
+				Scope:    permCheck.Scope,
+			}
+
+			userID, err := uuid.Parse(permCheck.UserId)
+			if err != nil {
+				result.Error = "Invalid user ID format"
+				resultChan <- checkResult{idx, result}
+				return
+			}
+
+			hasPermission, err := permissionService.CheckUserPermissionWithScope(
+				ctx, userID, permCheck.Resource, permCheck.Action, permCheck.Scope)
+			if err != nil {
+				result.Error = "Failed to check permission"
+			} else {
+				result.HasPermission = hasPermission
+			}
+
+			resultChan <- checkResult{idx, result}
+		}(i, check)
+	}
+
+	// Collect results
+	for i := 0; i < len(req.Checks); i++ {
+		checkRes := <-resultChan
+		results[checkRes.index] = checkRes.result
+	}
+
+	return &pb.BulkCheckPermissionsResponse{
+		Success: true,
+		Results: results,
+	}, nil
+}
+
+func (s *EnhancedAuthGRPCServer) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
 	return &pb.HealthCheckResponse{
 		Status:    "healthy",
 		Service:   "auth-service",
@@ -301,7 +971,7 @@ func (s *AuthGRPCServer) HealthCheck(ctx context.Context, req *pb.HealthCheckReq
 	}, nil
 }
 
-func (s *AuthGRPCServer) generateTokens(user models.User) (string, string, error) {
+func (s *EnhancedAuthGRPCServer) generateTokens(user models.User) (string, string, error) {
 	// Access token claims
 	accessClaims := middleware.Claims{
 		UserID:         user.ID,
@@ -341,4 +1011,334 @@ func (s *AuthGRPCServer) generateTokens(user models.User) (string, string, error
 	}
 
 	return accessTokenString, refreshTokenString, nil
+}
+
+// getTokenService returns the token service instance
+func (s *EnhancedAuthGRPCServer) getTokenService() *services.TokenService {
+	return s.tokenService
+}
+
+// getPermissionService returns the permission service instance
+func (s *EnhancedAuthGRPCServer) getPermissionService() *services.PermissionService {
+	return s.permissionService
+}
+
+// getAuthService returns the auth service instance
+func (s *EnhancedAuthGRPCServer) getAuthService() *services.AuthService {
+	return s.authService
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// convertUserToProto converts a models.User to pb.User with all relationships
+func (s *EnhancedAuthGRPCServer) convertUserToProto(user *models.User) *pb.User {
+	pbUser := &pb.User{
+		Id:             user.ID.String(),
+		OrganizationId: user.OrganizationID.String(),
+		Email:          user.Email,
+		FirstName:      user.FirstName,
+		LastName:       user.LastName,
+		IsActive:       user.IsActive,
+		IsVerified:     user.IsVerified,
+		CreatedAt:      timestamppb.New(user.CreatedAt),
+		UpdatedAt:      timestamppb.New(user.UpdatedAt),
+	}
+
+	if user.LastLoginAt != nil {
+		pbUser.LastLoginAt = timestamppb.New(*user.LastLoginAt)
+	}
+
+	// Add organization if loaded
+	if user.Organization.ID != uuid.Nil {
+		pbUser.Organization = &pb.Organization{
+			Id:        user.Organization.ID.String(),
+			Name:      user.Organization.Name,
+			Domain:    user.Organization.Domain,
+			IsActive:  user.Organization.IsActive,
+			CreatedAt: timestamppb.New(user.Organization.CreatedAt),
+			UpdatedAt: timestamppb.New(user.Organization.UpdatedAt),
+		}
+	}
+
+	return pbUser
+}
+
+// serializeUser serializes a pb.User to bytes for caching
+func (s *EnhancedAuthGRPCServer) serializeUser(user *pb.User) ([]byte, error) {
+	// Use protobuf marshaling for efficient serialization
+	return user.ProtoReflect().Interface().(interface{ Marshal() ([]byte, error) }).Marshal()
+}
+
+// deserializeUser deserializes bytes to a pb.User from cache
+func (s *EnhancedAuthGRPCServer) deserializeUser(data []byte, user *pb.User) error {
+	// Use protobuf unmarshaling for efficient deserialization
+	return user.ProtoReflect().Interface().(interface{ Unmarshal([]byte) error }).Unmarshal(data)
+}
+
+// Helper methods for new gRPC operations
+
+// createUserInExistingOrganization creates a user in an existing organization
+func (s *EnhancedAuthGRPCServer) createUserInExistingOrganization(ctx context.Context, orgID uuid.UUID, req *services.RegistrationRequest) (*models.User, error) {
+	// Hash password
+	hashedPassword, err := s.hashPassword(req.Password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	// Create user in transaction
+	var user models.User
+	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
+		return nil, s.db.Transaction(func(tx *gorm.DB) error {
+			// Check if organization exists
+			var org models.Organization
+			if err := tx.Where("id = ?", orgID).First(&org).Error; err != nil {
+				return fmt.Errorf("organization not found: %w", err)
+			}
+
+			// Check if email already exists
+			var existingUser models.User
+			if err := tx.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
+				return fmt.Errorf("user with email %s already exists", req.Email)
+			}
+
+			// Create user
+			user = models.User{
+				ID:             uuid.New(),
+				OrganizationID: orgID,
+				Email:          req.Email,
+				PasswordHash:   hashedPassword,
+				FirstName:      req.FirstName,
+				LastName:       req.LastName,
+				IsActive:       true,
+				IsVerified:     false,
+				CreatedAt:      time.Now(),
+				UpdatedAt:      time.Now(),
+			}
+
+			if err := tx.Create(&user).Error; err != nil {
+				return fmt.Errorf("failed to create user: %w", err)
+			}
+
+			// Assign default role (if exists)
+			var defaultRole models.Role
+			if err := tx.Where("organization_id = ? AND name = ?", orgID, "user").First(&defaultRole).Error; err == nil {
+				userRole := models.UserRole{
+					UserID: user.ID,
+					RoleID: defaultRole.ID,
+				}
+				tx.Create(&userRole)
+			}
+
+			return nil
+		})
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Publish user created event
+	s.publishUserCreatedEvent(ctx, &user, req.SecurityContext)
+
+	return &user, nil
+}
+
+// invalidateUserCaches invalidates all caches related to a user
+func (s *EnhancedAuthGRPCServer) invalidateUserCaches(ctx context.Context, userID, orgID uuid.UUID) {
+	cacheKeys := []string{
+		fmt.Sprintf("user:id:%s", userID.String()),
+		fmt.Sprintf("user:full:%s", userID.String()),
+		fmt.Sprintf("user:permissions:%s", userID.String()),
+		fmt.Sprintf("org:users:%s", orgID.String()),
+	}
+
+	for _, key := range cacheKeys {
+		if err := s.cacheManager.Delete(ctx, key); err != nil {
+			s.logger.Warn("Failed to invalidate cache", zap.String("key", key), zap.Error(err))
+		}
+	}
+}
+
+// publishUserUpdatedEvent publishes a user updated event
+func (s *EnhancedAuthGRPCServer) publishUserUpdatedEvent(ctx context.Context, user *models.User, securityCtx *pb.SecurityContext) {
+	// This would integrate with the event publisher
+	s.logger.Info("User updated", 
+		zap.String("user_id", user.ID.String()),
+		zap.String("email", user.Email))
+}
+
+// publishUserCreatedEvent publishes a user created event
+func (s *EnhancedAuthGRPCServer) publishUserCreatedEvent(ctx context.Context, user *models.User, securityCtx *services.SecurityContext) {
+	// This would integrate with the event publisher
+	s.logger.Info("User created", 
+		zap.String("user_id", user.ID.String()),
+		zap.String("email", user.Email))
+}
+
+// convertOrganizationToProto converts a models.Organization to pb.Organization
+func (s *EnhancedAuthGRPCServer) convertOrganizationToProto(org *models.Organization) *pb.Organization {
+	return &pb.Organization{
+		Id:        org.ID.String(),
+		Name:      org.Name,
+		Domain:    org.Domain,
+		IsActive:  org.IsActive,
+		CreatedAt: timestamppb.New(org.CreatedAt),
+		UpdatedAt: timestamppb.New(org.UpdatedAt),
+	}
+}
+
+// convertEntityUserToProto converts an entities.User to pb.User
+func (s *EnhancedAuthGRPCServer) convertEntityUserToProto(user *entities.User) *pb.User {
+	pbUser := &pb.User{
+		Id:             user.ID.String(),
+		OrganizationId: user.OrganizationID.String(),
+		Email:          user.Email,
+		FirstName:      user.FirstName,
+		LastName:       user.LastName,
+		IsActive:       user.IsActive,
+		IsVerified:     user.IsVerified,
+		CreatedAt:      timestamppb.New(user.CreatedAt),
+		UpdatedAt:      timestamppb.New(user.UpdatedAt),
+	}
+
+	if user.LastLoginAt != nil {
+		pbUser.LastLoginAt = timestamppb.New(*user.LastLoginAt)
+	}
+
+	return pbUser
+}
+
+// convertEntityTokenPairToProto converts an entities.TokenPair to pb.TokenPair
+func (s *EnhancedAuthGRPCServer) convertEntityTokenPairToProto(tokenPair *entities.TokenPair) *pb.TokenPair {
+	return &pb.TokenPair{
+		AccessToken:       tokenPair.AccessToken,
+		RefreshToken:      tokenPair.RefreshToken,
+		ExpiresAt:         timestamppb.New(tokenPair.ExpiresAt),
+		RefreshExpiresAt:  timestamppb.New(tokenPair.RefreshExpiresAt),
+		TokenType:         tokenPair.TokenType,
+	}
+}
+
+// serializeOrganization serializes a pb.Organization to bytes for caching
+func (s *EnhancedAuthGRPCServer) serializeOrganization(org *pb.Organization) ([]byte, error) {
+	return org.ProtoReflect().Interface().(interface{ Marshal() ([]byte, error) }).Marshal()
+}
+
+// deserializeOrganization deserializes bytes to a pb.Organization from cache
+func (s *EnhancedAuthGRPCServer) deserializeOrganization(data []byte, org *pb.Organization) error {
+	return org.ProtoReflect().Interface().(interface{ Unmarshal([]byte) error }).Unmarshal(data)
+}
+
+// processBulkUserCreation processes a batch of user creation requests
+func (s *EnhancedAuthGRPCServer) processBulkUserCreation(ctx context.Context, orgID uuid.UUID, users []*pb.CreateUserData, startIndex int) []*pb.BulkUserResult {
+	results := make([]*pb.BulkUserResult, len(users))
+
+	for i, userData := range users {
+		result := &pb.BulkUserResult{
+			Email: userData.Email,
+		}
+
+		// Validate user data
+		if userData.Email == "" || userData.Password == "" || userData.FirstName == "" || userData.LastName == "" {
+			result.Success = false
+			result.Error = "Email, password, first name, and last name are required"
+			results[i] = result
+			continue
+		}
+
+		// Create user
+		regReq := &services.RegistrationRequest{
+			Email:           userData.Email,
+			Password:        userData.Password,
+			FirstName:       userData.FirstName,
+			LastName:        userData.LastName,
+			SecurityContext: &services.SecurityContext{IPAddress: "bulk-operation", UserAgent: "grpc-bulk"},
+		}
+
+		user, err := s.createUserInExistingOrganization(ctx, orgID, regReq)
+		if err != nil {
+			result.Success = false
+			result.Error = err.Error()
+		} else {
+			result.Success = true
+			result.User = s.convertUserToProto(user)
+		}
+
+		results[i] = result
+	}
+
+	return results
+}
+
+// processBulkUserUpdate processes a batch of user update requests
+func (s *EnhancedAuthGRPCServer) processBulkUserUpdate(ctx context.Context, users []*pb.UpdateUserData, startIndex int) []*pb.BulkUserResult {
+	results := make([]*pb.BulkUserResult, len(users))
+
+	for i, userData := range users {
+		result := &pb.BulkUserResult{
+			Email: userData.Email,
+		}
+
+		// Validate user data
+		if userData.UserId == "" {
+			result.Success = false
+			result.Error = "User ID is required"
+			results[i] = result
+			continue
+		}
+
+		_, err := uuid.Parse(userData.UserId)
+		if err != nil {
+			result.Success = false
+			result.Error = "Invalid user ID format"
+			results[i] = result
+			continue
+		}
+
+		// Update user
+		updateReq := &pb.UpdateUserRequest{
+			UserId:    userData.UserId,
+			Email:     userData.Email,
+			FirstName: userData.FirstName,
+			LastName:  userData.LastName,
+			IsActive:  userData.IsActive,
+			IsVerified: userData.IsVerified,
+			RoleIds:   userData.RoleIds,
+			SecurityContext: &pb.SecurityContext{
+				IpAddress: "bulk-operation",
+				UserAgent: "grpc-bulk",
+			},
+		}
+
+		updateResp, err := s.UpdateUser(ctx, updateReq)
+		if err != nil {
+			result.Success = false
+			result.Error = err.Error()
+		} else if !updateResp.Success {
+			result.Success = false
+			result.Error = updateResp.Error
+		} else {
+			result.Success = true
+			result.User = updateResp.User
+		}
+
+		results[i] = result
+	}
+
+	return results
+}
+
+// hashPassword hashes a password using bcrypt
+func (s *EnhancedAuthGRPCServer) hashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
 }
