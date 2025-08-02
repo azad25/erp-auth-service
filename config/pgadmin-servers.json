@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Auth Service PostgreSQL",
+      "Group": "Servers",
+      "Host": "postgres-auth",
+      "Port": 5432,
+      "MaintenanceDB": "erp_auth",
+      "Username": "postgres",
+      "Password": "postgres",
+      "SSLMode": "prefer",
+      "Comment": "Auth Service standalone database"
+    }
+  }
+}
