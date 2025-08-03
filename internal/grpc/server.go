@@ -15,7 +15,9 @@ import (
 	"erp-auth-service/internal/config"
 	"erp-auth-service/internal/domain/entities"
 	"erp-auth-service/internal/errors"
+	"erp-auth-service/internal/events"
 	"erp-auth-service/internal/grpc/interceptors"
+	"erp-auth-service/internal/infrastructure/repositories"
 	"erp-auth-service/internal/middleware"
 	"erp-auth-service/internal/models"
 	pb "erp-auth-service/proto"
@@ -70,6 +72,111 @@ type EnhancedAuthGRPCServer struct {
 	// Shutdown coordination
 	shutdownCh chan struct{}
 	wg         sync.WaitGroup
+}
+
+// NewAuthGRPCServer creates a new gRPC server with properly initialized dependencies
+func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Config) *EnhancedAuthGRPCServer {
+	// Initialize logger
+	logger, err := zap.NewProduction()
+	if err != nil {
+		// Fallback to development logger if production fails
+		logger, _ = zap.NewDevelopment()
+	}
+	
+	// Initialize repository factory
+	repoFactory := repositories.NewRepositoryFactory(db, db) // Using same DB for read/write for now
+	
+	// Initialize cache manager with proper configuration
+	cacheConfig := cache.CacheConfig{
+		BigCacheConfig: cache.BigCacheConfig{
+			Shards:             1024,
+			LifeWindow:         10 * time.Minute,
+			CleanWindow:        5 * time.Minute,
+			MaxEntriesInWindow: 1000 * 10 * 60,
+			MaxEntrySize:       500,
+			HardMaxCacheSize:   8192,
+			Verbose:            false,
+		},
+		RedisConfig: cache.RedisClusterConfig{
+			Addrs:              []string{fmt.Sprintf("%s:%s", config.Redis.Host, config.Redis.Port)},
+			Password:           config.Redis.Password,
+			DB:                 config.Redis.DB,
+			PoolSize:           10,
+			MinIdleConns:       5,
+			MaxConnAge:         time.Hour,
+			PoolTimeout:        30 * time.Second,
+			IdleTimeout:        5 * time.Minute,
+			IdleCheckFrequency: time.Minute,
+			ReadTimeout:        3 * time.Second,
+			WriteTimeout:       3 * time.Second,
+			DialTimeout:        5 * time.Second,
+		},
+		DefaultTTL:        5 * time.Minute,
+		MaxRetries:        3,
+		RetryDelay:        100 * time.Millisecond,
+		EnableMetrics:     true,
+		MetricsInterval:   30 * time.Second,
+		SyncInterval:      time.Minute,
+		WarmupEnabled:     true,
+		WarmupBatchSize:   100,
+		InvalidationDelay: time.Second,
+	}
+	
+	var cacheManager cache.CacheManager
+	cacheManagerImpl, err := cache.NewCacheManager(cacheConfig, logger)
+	if err != nil {
+		logger.Error("Failed to initialize cache manager", zap.Error(err))
+		// Create a simple fallback cache manager
+		cacheManager = &SimpleCacheManager{redisClient: redisClient}
+	} else {
+		cacheManager = cacheManagerImpl
+	}
+	
+	// Initialize event publisher
+	eventPublisher := &KafkaEventPublisher{
+		producer: events.NewProducer(events.ProducerConfig{
+			Brokers: config.Kafka.Brokers,
+			Topic:   config.Kafka.Topic,
+		}),
+		logger: logger,
+	}
+	
+	// Initialize services with proper dependencies
+	tokenService := services.NewTokenService(
+		config,
+		logger,
+		repoFactory.TokenRepository(),
+		cacheManager,
+		redisClient,
+	)
+	
+	permissionService := services.NewPermissionService(
+		repoFactory.PermissionRepository(),
+		repoFactory.RoleRepository(),
+		repoFactory.UserRepository(),
+		cacheManager,
+		logger,
+		services.PermissionServiceConfig{
+			CacheTTL:              5 * time.Minute,
+			BulkEvaluationEnabled: true,
+			CacheWarmingEnabled:   true,
+			MaxCacheSize:          10000,
+			EvaluationTimeout:     30 * time.Second,
+		},
+	)
+	
+	authService := services.NewAuthService(
+		config,
+		logger,
+		repoFactory.UserRepository(),
+		repoFactory.OrganizationRepository(),
+		repoFactory.RoleRepository(),
+		tokenService,
+		eventPublisher,
+		cacheManager,
+	)
+	
+	return NewEnhancedAuthGRPCServer(db, redisClient, config, logger, authService, tokenService, permissionService, cacheManager)
 }
 
 // NewEnhancedAuthGRPCServer creates a new enhanced gRPC server
@@ -1342,3 +1449,151 @@ func (s *EnhancedAuthGRPCServer) hashPassword(password string) (string, error) {
 	}
 	return string(hash), nil
 }
+
+// SimpleCacheManager is a fallback cache manager implementation
+type SimpleCacheManager struct {
+	redisClient *redis.Client
+}
+
+func (s *SimpleCacheManager) Get(ctx context.Context, key string) ([]byte, error) {
+	return s.redisClient.Get(ctx, key).Bytes()
+}
+
+func (s *SimpleCacheManager) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return s.redisClient.Set(ctx, key, value, ttl).Err()
+}
+
+func (s *SimpleCacheManager) Delete(ctx context.Context, key string) error {
+	return s.redisClient.Del(ctx, key).Err()
+}
+
+func (s *SimpleCacheManager) Exists(ctx context.Context, key string) (bool, error) {
+	result, err := s.redisClient.Exists(ctx, key).Result()
+	return result > 0, err
+}
+
+func (s *SimpleCacheManager) Clear(ctx context.Context) error {
+	return s.redisClient.FlushDB(ctx).Err()
+}
+
+func (s *SimpleCacheManager) Stats() cache.CacheStats {
+	return cache.CacheStats{}
+}
+
+func (s *SimpleCacheManager) Close() error {
+	return nil
+}
+
+func (s *SimpleCacheManager) GetFromLevel(ctx context.Context, key string, level cache.CacheLevel) ([]byte, error) {
+	return s.Get(ctx, key)
+}
+
+func (s *SimpleCacheManager) SetToLevel(ctx context.Context, key string, value []byte, ttl time.Duration, level cache.CacheLevel) error {
+	return s.Set(ctx, key, value, ttl)
+}
+
+func (s *SimpleCacheManager) InvalidateKey(ctx context.Context, key string) error {
+	return s.Delete(ctx, key)
+}
+
+func (s *SimpleCacheManager) InvalidatePattern(ctx context.Context, pattern string) error {
+	keys, err := s.redisClient.Keys(ctx, pattern).Result()
+	if err != nil {
+		return err
+	}
+	if len(keys) > 0 {
+		return s.redisClient.Del(ctx, keys...).Err()
+	}
+	return nil
+}
+
+func (s *SimpleCacheManager) WarmCache(ctx context.Context, keys []string) error {
+	return nil // No-op for simple implementation
+}
+
+func (s *SimpleCacheManager) GetCache(name string) cache.Cache {
+	return s
+}
+
+func (s *SimpleCacheManager) RegisterCache(name string, cache cache.Cache) error {
+	return nil // No-op for simple implementation
+}
+
+func (s *SimpleCacheManager) SetStrategy(strategy cache.CacheStrategy) {
+	// No-op for simple implementation
+}
+
+func (s *SimpleCacheManager) GetStrategy() cache.CacheStrategy {
+	return cache.WriteThrough
+}
+
+func (s *SimpleCacheManager) Sync(ctx context.Context) error {
+	return nil // No-op for simple implementation
+}
+
+// KafkaEventPublisher implements the EventPublisherInterface for Kafka
+type KafkaEventPublisher struct {
+	producer *events.Producer
+	logger   *zap.Logger
+}
+
+func (k *KafkaEventPublisher) PublishUserLoggedIn(ctx context.Context, data events.UserLoggedInData, userID, orgID uuid.UUID, ipAddress, userAgent string) error {
+	event := events.BaseEvent{
+		ID:             uuid.New(),
+		Type:           events.EventTypeUserLoggedIn,
+		Source:         "auth-service",
+		Timestamp:      time.Now(),
+		UserID:         &userID,
+		OrganizationID: &orgID,
+		IPAddress:      ipAddress,
+		UserAgent:      userAgent,
+		Data:           data,
+	}
+	return k.producer.PublishEvent(ctx, event)
+}
+
+func (k *KafkaEventPublisher) PublishUserRegistered(ctx context.Context, data events.UserRegisteredData, userID, orgID uuid.UUID, ipAddress, userAgent string) error {
+	event := events.BaseEvent{
+		ID:             uuid.New(),
+		Type:           events.EventTypeUserRegistered,
+		Source:         "auth-service",
+		Timestamp:      time.Now(),
+		UserID:         &userID,
+		OrganizationID: &orgID,
+		IPAddress:      ipAddress,
+		UserAgent:      userAgent,
+		Data:           data,
+	}
+	return k.producer.PublishEvent(ctx, event)
+}
+
+func (k *KafkaEventPublisher) PublishOrganizationCreated(ctx context.Context, data events.OrganizationCreatedData, userID, orgID uuid.UUID, ipAddress, userAgent string) error {
+	event := events.BaseEvent{
+		ID:             uuid.New(),
+		Type:           events.EventTypeOrganizationCreated,
+		Source:         "auth-service",
+		Timestamp:      time.Now(),
+		UserID:         &userID,
+		OrganizationID: &orgID,
+		IPAddress:      ipAddress,
+		UserAgent:      userAgent,
+		Data:           data,
+	}
+	return k.producer.PublishEvent(ctx, event)
+}
+
+func (k *KafkaEventPublisher) PublishPasswordChanged(ctx context.Context, data events.PasswordChangedData, userID, orgID uuid.UUID, ipAddress, userAgent string) error {
+	event := events.BaseEvent{
+		ID:             uuid.New(),
+		Type:           events.EventTypePasswordChanged,
+		Source:         "auth-service",
+		Timestamp:      time.Now(),
+		UserID:         &userID,
+		OrganizationID: &orgID,
+		IPAddress:      ipAddress,
+		UserAgent:      userAgent,
+		Data:           data,
+	}
+	return k.producer.PublishEvent(ctx, event)
+}
+

@@ -41,7 +41,7 @@ func main() {
 
 	// Handle seeding if requested via command line flags
 	if *seedFlag || *seedMinimal {
-		s := seeder.NewSeeder(db)
+		s := seeder.NewSeeder(db.GetWriteDB())
 		
 		if *seedMinimal {
 			log.Println("🌱 Running minimal database seeding...")
@@ -60,7 +60,7 @@ func main() {
 	}
 
 	// Seed database with initial data on startup (if not already seeded)
-	seederInstance := seeder.NewSeeder(db)
+	seederInstance := seeder.NewSeeder(db.GetWriteDB())
 	if err := seederInstance.SeedAll(); err != nil {
 		log.Printf("Warning: Failed to seed database: %v", err)
 		// Don't fail startup if seeding fails, just log the warning
@@ -92,7 +92,7 @@ func main() {
 		defer wg.Done()
 		
 		// Initialize router with Kafka producer
-		r := router.Initialize(db, redisClient, cfg, kafkaProducer)
+		r := router.Initialize(db.GetWriteDB(), redisClient, cfg, kafkaProducer)
 
 		log.Printf("Starting HTTP server on port %s", cfg.Server.Port)
 		if err := r.Run(":" + cfg.Server.Port); err != nil {
@@ -105,9 +105,9 @@ func main() {
 	go func() {
 		defer wg.Done()
 		
-		grpcSrv := grpcServer.NewAuthGRPCServer(db, redisClient, cfg)
+		grpcSrv := grpcServer.NewAuthGRPCServer(db.GetWriteDB(), redisClient, cfg)
 		log.Printf("Starting gRPC server on port %s", cfg.GRPC.Port)
-		if err := grpcSrv.Start(cfg.GRPC.Port); err != nil {
+		if err := grpcSrv.Start(); err != nil {
 			log.Printf("gRPC server error: %v", err)
 		}
 	}()
