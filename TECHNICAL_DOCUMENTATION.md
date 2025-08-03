@@ -848,7 +848,7 @@ Reset password using reset token.
 ## Getting Started
 
 ### Prerequisites
-- Go 1.21 or higher
+- Go 1.23 or higher
 - PostgreSQL 13 or higher
 - Redis 6 or higher
 - Docker and Docker Compose (for containerized development)

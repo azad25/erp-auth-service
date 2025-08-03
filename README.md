@@ -40,7 +40,7 @@ make dev-full-stack
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.23+
 - Infrastructure services running (see above)
 
 ### Running Locally

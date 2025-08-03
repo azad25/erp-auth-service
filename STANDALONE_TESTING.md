@@ -14,7 +14,7 @@ The standalone testing environment provides:
 ## 📋 Prerequisites
 
 - Docker 20.10+ and Docker Compose 2.0+
-- Go 1.21+ (for local development)
+- Go 1.23+ (for local development)
 - curl (for health checks)
 - grpcurl (optional, for gRPC testing)
 
