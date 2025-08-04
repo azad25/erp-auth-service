@@ -1,0 +1,62 @@
+2025/08/04 14:50:39 Migration 001_initial_schema already applied, skipping
+2025/08/04 14:50:39 Migration 002_add_token_table already applied, skipping
+2025/08/04 14:50:39 Migration 003_add_performance_indexes already applied, skipping
+2025/08/04 14:50:39 Migration 004_create_materialized_views already applied, skipping
+2025/08/04 14:50:39 🌱 Starting database seeding...
+2025/08/04 14:50:39 ⚠️  Database already contains 101 users. Skipping seeding.
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] GET    /health                   --> erp-auth-service/internal/router.Initialize.func1 (4 handlers)
+[GIN-debug] POST   /api/v1/auth/register     --> erp-auth-service/internal/handlers.(*AuthHandler).Register-fm (4 handlers)
+[GIN-debug] POST   /api/v1/auth/login        --> erp-auth-service/internal/handlers.(*AuthHandler).Login-fm (4 handlers)
+[GIN-debug] POST   /api/v1/auth/refresh      --> erp-auth-service/internal/handlers.(*AuthHandler).RefreshToken-fm (4 handlers)
+[GIN-debug] POST   /api/v1/auth/forgot-password --> erp-auth-service/internal/handlers.(*AuthHandler).ForgotPassword-fm (4 handlers)
+[GIN-debug] POST   /api/v1/auth/reset-password --> erp-auth-service/internal/handlers.(*AuthHandler).ResetPassword-fm (4 handlers)
+[GIN-debug] GET    /api/v1/users/profile     --> erp-auth-service/internal/handlers.(*UserHandler).GetProfile-fm (6 handlers)
+[GIN-debug] PUT    /api/v1/users/profile     --> erp-auth-service/internal/handlers.(*UserHandler).UpdateProfile-fm (6 handlers)
+[GIN-debug] POST   /api/v1/users/change-password --> erp-auth-service/internal/handlers.(*UserHandler).ChangePassword-fm (6 handlers)
+[GIN-debug] POST   /api/v1/users/enable-2fa  --> erp-auth-service/internal/handlers.(*UserHandler).Enable2FA-fm (6 handlers)
+[GIN-debug] POST   /api/v1/users/disable-2fa --> erp-auth-service/internal/handlers.(*UserHandler).Disable2FA-fm (6 handlers)
+[GIN-debug] GET    /api/v1/roles/            --> erp-auth-service/internal/handlers.(*RoleHandler).GetRoles-fm (6 handlers)
+[GIN-debug] POST   /api/v1/roles/            --> erp-auth-service/internal/handlers.(*RoleHandler).CreateRole-fm (6 handlers)
+[GIN-debug] GET    /api/v1/roles/:id         --> erp-auth-service/internal/handlers.(*RoleHandler).GetRole-fm (6 handlers)
+[GIN-debug] PUT    /api/v1/roles/:id         --> erp-auth-service/internal/handlers.(*RoleHandler).UpdateRole-fm (6 handlers)
+[GIN-debug] DELETE /api/v1/roles/:id         --> erp-auth-service/internal/handlers.(*RoleHandler).DeleteRole-fm (6 handlers)
+[GIN-debug] POST   /api/v1/roles/:id/permissions --> erp-auth-service/internal/handlers.(*RoleHandler).AssignPermissions-fm (6 handlers)
+[GIN-debug] DELETE /api/v1/roles/:id/permissions/:permissionId --> erp-auth-service/internal/handlers.(*RoleHandler).RemovePermission-fm (6 handlers)
+[GIN-debug] POST   /api/v1/user-roles/assign --> erp-auth-service/internal/handlers.(*RoleHandler).AssignUserRole-fm (6 handlers)
+[GIN-debug] DELETE /api/v1/user-roles/revoke --> erp-auth-service/internal/handlers.(*RoleHandler).RevokeUserRole-fm (6 handlers)
+[GIN-debug] GET    /api/v1/user-roles/user/:userId --> erp-auth-service/internal/handlers.(*RoleHandler).GetUserRoles-fm (6 handlers)
+[GIN-debug] GET    /api/v1/permissions/      --> erp-auth-service/internal/handlers.(*RoleHandler).GetPermissions-fm (6 handlers)
+[GIN-debug] GET    /api/v1/organization/     --> erp-auth-service/internal/handlers.(*UserHandler).GetOrganization-fm (6 handlers)
+[GIN-debug] PUT    /api/v1/organization/     --> erp-auth-service/internal/handlers.(*UserHandler).UpdateOrganization-fm (6 handlers)
+[GIN-debug] POST   /api/v1/internal/validate-token --> erp-auth-service/internal/handlers.(*AuthHandler).ValidateToken-fm (5 handlers)
+[GIN-debug] GET    /api/v1/internal/user/:id --> erp-auth-service/internal/handlers.(*UserHandler).GetUserByID-fm (5 handlers)
+[GIN-debug] POST   /api/v1/internal/check-permission --> erp-auth-service/internal/handlers.(*RoleHandler).CheckPermission-fm (5 handlers)
+2025/08/04 14:50:39 Starting HTTP server on port 8080
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on :8080
+[GIN-debug] [ERROR] listen tcp :8080: bind: address already in use
+2025/08/04 14:50:39 HTTP server error: listen tcp :8080: bind: address already in use
+{"level":"info","ts":1754297439.801375,"caller":"services/permission_cache_warmer.go:120","msg":"Starting permission cache warmer","component":"permission_cache_warmer"}
+{"level":"info","ts":1754297439.8014011,"caller":"services/worker_pool.go:74","msg":"Starting worker pool","component":"worker_pool","pool":"password_hashing","size":5}
+{"level":"info","ts":1754297439.8014688,"caller":"services/worker_pool.go:96","msg":"Worker pool started successfully","component":"worker_pool","pool":"password_hashing"}
+{"level":"info","ts":1754297439.8014836,"caller":"services/worker_pool.go:74","msg":"Starting worker pool","component":"worker_pool","pool":"cache_warming","size":10}
+{"level":"info","ts":1754297439.8015184,"caller":"services/worker_pool.go:96","msg":"Worker pool started successfully","component":"worker_pool","pool":"cache_warming"}
+{"level":"info","ts":1754297439.801536,"caller":"services/worker_pool.go:74","msg":"Starting worker pool","component":"worker_pool","pool":"audit_logging","size":3}
+{"level":"info","ts":1754297439.8015518,"caller":"services/worker_pool.go:96","msg":"Worker pool started successfully","component":"worker_pool","pool":"audit_logging"}
+{"level":"info","ts":1754297439.8015916,"caller":"errors/circuit_breaker.go:106","msg":"Circuit breaker registered","name":"database","max_requests":10,"interval":30,"timeout":60}
+{"level":"info","ts":1754297439.801628,"caller":"errors/circuit_breaker.go:106","msg":"Circuit breaker registered","name":"redis","max_requests":15,"interval":20,"timeout":30}
+{"level":"info","ts":1754297439.8016346,"caller":"errors/circuit_breaker.go:106","msg":"Circuit breaker registered","name":"kafka","max_requests":5,"interval":60,"timeout":120}
+{"level":"info","ts":1754297439.801659,"caller":"errors/recovery.go:134","msg":"Recovery strategy registered","service":"database","strategy":"RETRY_WITH_BACKOFF"}
+{"level":"info","ts":1754297439.8016748,"caller":"errors/recovery.go:134","msg":"Recovery strategy registered","service":"cache","strategy":"GRACEFUL_DEGRADATION"}
+{"level":"info","ts":1754297439.8016806,"caller":"errors/recovery.go:134","msg":"Recovery strategy registered","service":"events","strategy":"RETRY_WITH_BACKOFF"}
+2025/08/04 14:50:39 Starting gRPC server on port 50051
+2025/08/04 14:50:39 gRPC server error: failed to listen on port 50051: listen tcp :50051: bind: address already in use
+2025/08/04 14:51:19 Shutting down servers...
+2025/08/04 14:51:19 Servers shut down gracefully

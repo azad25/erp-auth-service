@@ -40,9 +40,13 @@ func NewAuthInterceptor(jwtSecret, serviceKey string, logger *zap.Logger) *AuthI
 	
 	// Define methods that can use service key authentication
 	serviceKeyMethods := map[string]bool{
-		"/auth.AuthService/ValidateToken":    true,
-		"/auth.AuthService/CheckPermission":  true,
-		"/auth.AuthService/GetUser":          true,
+		"/auth.AuthService/ValidateToken":       true,
+		"/auth.AuthService/CheckPermission":     true,
+		"/auth.AuthService/GetUser":             true,
+		"/auth.AuthService/Authenticate":        true,
+		"/auth.AuthService/CreateOrganization":  true,
+		"/auth.AuthService/RefreshToken":        true,
+		"/auth.AuthService/RevokeToken":         true,
 	}
 	
 	return &AuthInterceptor{

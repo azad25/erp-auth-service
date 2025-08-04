@@ -4,6 +4,23 @@ FROM golang:1.23-alpine
 # Install runtime dependencies
 RUN apk add --no-cache git ca-certificates tzdata protobuf-dev curl
 
+# Install Protobuf Compiler (protoc)
+ENV PROTOC_VERSION=27.2
+RUN apk add --no-cache curl unzip \
+    && curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip \
+    && unzip protoc-${PROTOC_VERSION}-linux-x86_64.zip -d /usr/local \
+    && rm protoc-${PROTOC_VERSION}-linux-x86_64.zip
+    
+# Configure the PATH for the plugins
+ENV PATH="/root/go/bin:${PATH}"
+
+# Install protoc plugins and Air for hot reload as appuser
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.1 && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0
+
+# Install air for hot reloading (compatible with Go 1.23)
+RUN go install github.com/cosmtrek/air@v1.49.0
+
 # Create app user (matching docker-compose user: "1000:1000")
 RUN addgroup -g 1000 -S appgroup && \
     adduser -u 1000 -S appuser -G appgroup
@@ -18,10 +35,6 @@ RUN mkdir -p /go/pkg/mod/cache /go/cache && \
 # Switch to non-root user
 USER appuser
 
-# Install protoc plugins and Air for hot reload as appuser
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.1 && \
-    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0 && \
-    go install github.com/cosmtrek/air@v1.49.0
 
 # Set Go environment variables for proper cache handling
 ENV GOCACHE=/go/cache
@@ -32,6 +45,9 @@ COPY --chown=appuser:appgroup go.mod go.sum ./
 
 # Download dependencies
 RUN go mod download
+
+# Copy source code
+COPY . .
 
 # Expose ports
 EXPOSE 8080 50051

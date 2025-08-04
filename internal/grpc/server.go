@@ -382,6 +382,77 @@ func (s *EnhancedAuthGRPCServer) GetMetricsRegistry() *prometheus.Registry {
 	return s.metricsRegistry
 }
 
+// Authenticate handles user authentication with email and password
+func (s *EnhancedAuthGRPCServer) Authenticate(ctx context.Context, req *pb.AuthenticateRequest) (*pb.AuthenticateResponse, error) {
+	// Validate input
+	if req.Email == "" || req.Password == "" {
+		return &pb.AuthenticateResponse{
+			Success: false,
+			Error:   "email and password are required",
+		}, nil
+	}
+
+	// Convert gRPC request to auth service request
+	authReq := &services.AuthRequest{
+		Email:    req.Email,
+		Password: req.Password,
+		SecurityContext: &services.SecurityContext{
+			IPAddress:   req.SecurityContext.GetIpAddress(),
+			UserAgent:   req.SecurityContext.GetUserAgent(),
+			SessionID:   req.SecurityContext.GetSessionId(),
+		},
+		RememberMe: req.RememberMe,
+	}
+
+	// Call auth service
+	authResp, err := s.authService.Authenticate(ctx, authReq)
+	if err != nil {
+		s.logger.Error("Authentication failed", zap.Error(err))
+		return &pb.AuthenticateResponse{
+			Success: false,
+			Error:   "authentication failed",
+		}, nil
+	}
+
+	// Convert response
+	response := &pb.AuthenticateResponse{
+		Success: authResp.Success,
+		Error:   authResp.Error,
+	}
+
+	if authResp.Success && authResp.User != nil {
+		// Convert user
+		response.User = &pb.User{
+			Id:             authResp.User.ID.String(),
+			OrganizationId: authResp.User.OrganizationID.String(),
+			Email:          authResp.User.Email,
+			FirstName:      authResp.User.FirstName,
+			LastName:       authResp.User.LastName,
+			IsActive:       authResp.User.IsActive,
+			IsVerified:     authResp.User.IsVerified,
+			CreatedAt:      timestamppb.New(authResp.User.CreatedAt),
+			UpdatedAt:      timestamppb.New(authResp.User.UpdatedAt),
+		}
+
+		if authResp.User.LastLoginAt != nil {
+			response.User.LastLoginAt = timestamppb.New(*authResp.User.LastLoginAt)
+		}
+
+		// Convert tokens if available
+		if authResp.TokenPair != nil {
+			response.Tokens = &pb.TokenPair{
+				AccessToken:  authResp.TokenPair.AccessToken,
+				RefreshToken: authResp.TokenPair.RefreshToken,
+				TokenType:    authResp.TokenPair.TokenType,
+				ExpiresAt:    timestamppb.New(authResp.TokenPair.ExpiresAt),
+				RefreshExpiresAt: timestamppb.New(authResp.TokenPair.RefreshExpiresAt),
+			}
+		}
+	}
+
+	return response, nil
+}
+
 // ValidateToken validates a JWT token with sub-10ms response time optimization
 func (s *EnhancedAuthGRPCServer) ValidateToken(ctx context.Context, req *pb.ValidateTokenRequest) (*pb.ValidateTokenResponse, error) {
 	// Start performance timer
