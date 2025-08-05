@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"

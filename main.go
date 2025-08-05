@@ -46,8 +46,8 @@ func main() {
 	ctx := context.Background()
 
 	logger.Info(ctx, "Starting ERP Auth Service", map[string]interface{}{
-		"version":     "1.0.0",
-		"environment": cfg.Environment,
+		"version": "1.0.0",
+		"port":    cfg.Server.Port,
 	})
 
 	// Initialize database
@@ -123,8 +123,8 @@ func main() {
 	go func() {
 		defer wg.Done()
 		
-		// Initialize router with Kafka producer and logger
-		r := router.Initialize(db.GetWriteDB(), redisClient, cfg, kafkaProducer, logger)
+		// Initialize router with Kafka producer
+		r := router.Initialize(db.GetWriteDB(), redisClient, cfg, kafkaProducer)
 
 		logger.Info(ctx, "Starting HTTP server", map[string]interface{}{
 			"port": cfg.Server.Port,
@@ -142,7 +142,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		
-		grpcSrv := grpcServer.NewAuthGRPCServer(db.GetWriteDB(), redisClient, cfg, logger)
+		grpcSrv := grpcServer.NewAuthGRPCServer(db.GetWriteDB(), redisClient, cfg)
 		
 		logger.Info(ctx, "Starting gRPC server", map[string]interface{}{
 			"port": cfg.GRPC.Port,
