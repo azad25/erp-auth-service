@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"erp-auth-service/internal/database"
 	"erp-auth-service/internal/events"
 	grpcServer "erp-auth-service/internal/grpc"
+	"erp-auth-service/internal/logging"
 	"erp-auth-service/internal/redis"
 	"erp-auth-service/internal/router"
 	"erp-auth-service/internal/seeder"
@@ -33,44 +35,73 @@ func main() {
 	// Initialize configuration
 	cfg := config.Load()
 
+	// Initialize logging system
+	loggingConfig := logging.DefaultLoggingServiceConfig()
+	if err := logging.InitializeGlobalLogger(loggingConfig); err != nil {
+		log.Printf("Warning: Failed to initialize logging service: %v", err)
+	}
+	defer logging.CloseGlobalLogger()
+
+	logger := logging.GetGlobalLogger()
+	ctx := context.Background()
+
+	logger.Info(ctx, "Starting ERP Auth Service", map[string]interface{}{
+		"version":     "1.0.0",
+		"environment": cfg.Environment,
+	})
+
 	// Initialize database
 	db, err := database.Initialize(cfg.Database)
 	if err != nil {
-		log.Fatal("Failed to initialize database:", err)
+		logger.Fatal(ctx, "Failed to initialize database", map[string]interface{}{
+			"error": err.Error(),
+		})
 	}
+
+	logger.Info(ctx, "Database initialized successfully", nil)
 
 	// Handle seeding if requested via command line flags
 	if *seedFlag || *seedMinimal {
 		s := seeder.NewSeeder(db.GetWriteDB())
 		
 		if *seedMinimal {
-			log.Println("🌱 Running minimal database seeding...")
+			logger.Info(ctx, "Running minimal database seeding", nil)
 			if err := s.SeedMinimal(); err != nil {
-				log.Fatal("Failed to run minimal seeding:", err)
+				logger.Fatal(ctx, "Failed to run minimal seeding", map[string]interface{}{
+					"error": err.Error(),
+				})
 			}
 		} else {
-			log.Println("🌱 Running full database seeding...")
+			logger.Info(ctx, "Running full database seeding", nil)
 			if err := s.SeedAll(); err != nil {
-				log.Fatal("Failed to run full seeding:", err)
+				logger.Fatal(ctx, "Failed to run full seeding", map[string]interface{}{
+					"error": err.Error(),
+				})
 			}
 		}
 		
-		log.Println("✅ Seeding completed, exiting...")
+		logger.Info(ctx, "Seeding completed, exiting", nil)
 		return
 	}
 
 	// Seed database with initial data on startup (if not already seeded)
 	seederInstance := seeder.NewSeeder(db.GetWriteDB())
 	if err := seederInstance.SeedAll(); err != nil {
-		log.Printf("Warning: Failed to seed database: %v", err)
+		logger.Warn(ctx, "Failed to seed database", map[string]interface{}{
+			"error": err.Error(),
+		})
 		// Don't fail startup if seeding fails, just log the warning
 	}
 
 	// Initialize Redis
 	redisClient, err := redis.Initialize(cfg.Redis)
 	if err != nil {
-		log.Fatal("Failed to initialize Redis:", err)
+		logger.Fatal(ctx, "Failed to initialize Redis", map[string]interface{}{
+			"error": err.Error(),
+		})
 	}
+
+	logger.Info(ctx, "Redis initialized successfully", nil)
 
 	// Initialize Kafka producer
 	kafkaProducer := events.NewProducer(events.ProducerConfig{
@@ -79,9 +110,10 @@ func main() {
 	})
 	defer kafkaProducer.Close()
 
-	// Context for graceful shutdown (simplified for now)
-	// ctx, cancel := context.WithCancel(context.Background())
-	// defer cancel()
+	logger.Info(ctx, "Kafka producer initialized successfully", map[string]interface{}{
+		"brokers": cfg.Kafka.Brokers,
+		"topic":   cfg.Kafka.Topic,
+	})
 
 	// Wait group for goroutines
 	var wg sync.WaitGroup
@@ -91,12 +123,17 @@ func main() {
 	go func() {
 		defer wg.Done()
 		
-		// Initialize router with Kafka producer
-		r := router.Initialize(db.GetWriteDB(), redisClient, cfg, kafkaProducer)
+		// Initialize router with Kafka producer and logger
+		r := router.Initialize(db.GetWriteDB(), redisClient, cfg, kafkaProducer, logger)
 
-		log.Printf("Starting HTTP server on port %s", cfg.Server.Port)
+		logger.Info(ctx, "Starting HTTP server", map[string]interface{}{
+			"port": cfg.Server.Port,
+		})
+		
 		if err := r.Run(":" + cfg.Server.Port); err != nil {
-			log.Printf("HTTP server error: %v", err)
+			logger.Error(ctx, "HTTP server error", map[string]interface{}{
+				"error": err.Error(),
+			})
 		}
 	}()
 
@@ -105,10 +142,16 @@ func main() {
 	go func() {
 		defer wg.Done()
 		
-		grpcSrv := grpcServer.NewAuthGRPCServer(db.GetWriteDB(), redisClient, cfg)
-		log.Printf("Starting gRPC server on port %s", cfg.GRPC.Port)
+		grpcSrv := grpcServer.NewAuthGRPCServer(db.GetWriteDB(), redisClient, cfg, logger)
+		
+		logger.Info(ctx, "Starting gRPC server", map[string]interface{}{
+			"port": cfg.GRPC.Port,
+		})
+		
 		if err := grpcSrv.Start(); err != nil {
-			log.Printf("gRPC server error: %v", err)
+			logger.Error(ctx, "gRPC server error", map[string]interface{}{
+				"error": err.Error(),
+			})
 		}
 	}()
 
@@ -118,9 +161,9 @@ func main() {
 
 	// Block until signal received
 	<-sigChan
-	log.Println("Shutting down servers...")
+	logger.Info(ctx, "Received shutdown signal, shutting down servers", nil)
 
 	// Wait for all goroutines to finish
 	wg.Wait()
-	log.Println("Servers shut down gracefully")
+	logger.Info(ctx, "Servers shut down gracefully", nil)
 }
