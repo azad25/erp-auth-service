@@ -1668,3 +1668,933 @@ func (k *KafkaEventPublisher) PublishPasswordChanged(ctx context.Context, data e
 	return k.producer.PublishEvent(ctx, event)
 }
 
+// ListUsers implements ListUsers method for user management
+func (s *EnhancedAuthGRPCServer) ListUsers(ctx context.Context, req *pb.ListUsersRequest) (*pb.ListUsersResponse, error) {
+	// Validate input
+	if req.OrganizationId == "" {
+		return &pb.ListUsersResponse{
+			Success: false,
+			Error:   "Organization ID is required",
+		}, nil
+	}
+
+	// Set defaults
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Parse organization ID
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.ListUsersResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	// Get users from database
+	var users []models.User
+	var totalCount int64
+
+	// Build query
+	query := s.db.WithContext(ctx).Where("organization_id = ?", orgID)
+	
+	// Add search filter if provided
+	if req.Search != "" {
+		searchTerm := "%" + req.Search + "%"
+		query = query.Where("first_name ILIKE ? OR last_name ILIKE ? OR email ILIKE ?", 
+			searchTerm, searchTerm, searchTerm)
+	}
+
+	// Get total count
+	if err := query.Model(&models.User{}).Count(&totalCount).Error; err != nil {
+		s.logger.Error("Failed to count users", zap.Error(err))
+		return &pb.ListUsersResponse{
+			Success: false,
+			Error:   "Failed to count users",
+		}, nil
+	}
+
+	// Add sorting
+	sortBy := req.SortBy
+	if sortBy == "" {
+		sortBy = "created_at"
+	}
+	sortOrder := req.SortOrder
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
+	query = query.Order(fmt.Sprintf("%s %s", sortBy, sortOrder))
+
+	// Add pagination
+	query = query.Limit(int(limit)).Offset(int(offset))
+
+	// Execute query with preloading
+	if err := query.Preload("Organization").Find(&users).Error; err != nil {
+		s.logger.Error("Failed to list users", zap.Error(err))
+		return &pb.ListUsersResponse{
+			Success: false,
+			Error:   "Failed to retrieve users",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbUsers := make([]*pb.User, len(users))
+	for i, user := range users {
+		pbUsers[i] = s.convertUserToProto(&user)
+	}
+
+	return &pb.ListUsersResponse{
+		Success:     true,
+		Users:       pbUsers,
+		TotalCount:  int32(totalCount),
+		HasNextPage: int32(offset+limit) < int32(totalCount),
+	}, nil
+}
+
+// GetUserStats implements GetUserStats method for dashboard statistics
+func (s *EnhancedAuthGRPCServer) GetUserStats(ctx context.Context, req *pb.GetUserStatsRequest) (*pb.GetUserStatsResponse, error) {
+	// Validate input
+	if req.OrganizationId == "" {
+		return &pb.GetUserStatsResponse{
+			Success: false,
+			Error:   "Organization ID is required",
+		}, nil
+	}
+
+	// Parse organization ID
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.GetUserStatsResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	// Get user statistics
+	var stats pb.UserStats
+	
+	// Total users
+	var totalUsers int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ?", orgID).Count(&totalUsers).Error; err != nil {
+		s.logger.Error("Failed to count total users", zap.Error(err))
+		return &pb.GetUserStatsResponse{Success: false, Error: "Failed to get user statistics"}, nil
+	}
+	stats.TotalUsers = int32(totalUsers)
+
+	// Active users
+	var activeUsers int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ? AND is_active = ?", orgID, true).Count(&activeUsers).Error; err != nil {
+		s.logger.Error("Failed to count active users", zap.Error(err))
+		return &pb.GetUserStatsResponse{Success: false, Error: "Failed to get user statistics"}, nil
+	}
+	stats.ActiveUsers = int32(activeUsers)
+	stats.InactiveUsers = int32(totalUsers - activeUsers)
+
+	// Verified users
+	var verifiedUsers int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ? AND is_verified = ?", orgID, true).Count(&verifiedUsers).Error; err != nil {
+		s.logger.Error("Failed to count verified users", zap.Error(err))
+		return &pb.GetUserStatsResponse{Success: false, Error: "Failed to get user statistics"}, nil
+	}
+	stats.VerifiedUsers = int32(verifiedUsers)
+	stats.UnverifiedUsers = int32(totalUsers - verifiedUsers)
+
+	// Recent signups (last 7 days)
+	var recentSignups int64
+	sevenDaysAgo := time.Now().AddDate(0, 0, -7)
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ? AND created_at >= ?", orgID, sevenDaysAgo).Count(&recentSignups).Error; err != nil {
+		s.logger.Error("Failed to count recent signups", zap.Error(err))
+		return &pb.GetUserStatsResponse{Success: false, Error: "Failed to get user statistics"}, nil
+	}
+	stats.RecentSignups = int32(recentSignups)
+
+	// Recent logins (last 7 days)
+	var recentLogins int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ? AND last_login_at >= ?", orgID, sevenDaysAgo).Count(&recentLogins).Error; err != nil {
+		s.logger.Error("Failed to count recent logins", zap.Error(err))
+		return &pb.GetUserStatsResponse{Success: false, Error: "Failed to get user statistics"}, nil
+	}
+	stats.RecentLogins = int32(recentLogins)
+
+	return &pb.GetUserStatsResponse{
+		Success: true,
+		Stats:   &stats,
+	}, nil
+}
+
+// GetSecurityStats implements GetSecurityStats method for security dashboard
+func (s *EnhancedAuthGRPCServer) GetSecurityStats(ctx context.Context, req *pb.GetSecurityStatsRequest) (*pb.GetSecurityStatsResponse, error) {
+	// Validate input
+	if req.OrganizationId == "" {
+		return &pb.GetSecurityStatsResponse{
+			Success: false,
+			Error:   "Organization ID is required",
+		}, nil
+	}
+
+	// Parse organization ID
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.GetSecurityStatsResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	// Get security statistics
+	var stats pb.SecurityStats
+	
+	// For now, return mock data since we don't have security event tables yet
+	// In a real implementation, these would query security event tables
+	stats.FailedLoginsToday = 0
+	stats.LockedAccounts = 0
+	stats.SecurityAlerts = 0
+	
+	// Two-factor enabled users
+	var twoFactorEnabled int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ? AND two_factor_enabled = ?", orgID, true).Count(&twoFactorEnabled).Error; err != nil {
+		s.logger.Error("Failed to count two-factor enabled users", zap.Error(err))
+		return &pb.GetSecurityStatsResponse{Success: false, Error: "Failed to get security statistics"}, nil
+	}
+	stats.TwoFactorEnabled = int32(twoFactorEnabled)
+	
+	stats.PasswordResetsToday = 0
+
+	return &pb.GetSecurityStatsResponse{
+		Success: true,
+		Stats:   &stats,
+	}, nil
+}
+
+// GetUserActivity implements GetUserActivity method for activity logs
+func (s *EnhancedAuthGRPCServer) GetUserActivity(ctx context.Context, req *pb.GetUserActivityRequest) (*pb.GetUserActivityResponse, error) {
+	// For now, return empty activity since we don't have activity logging tables yet
+	// In a real implementation, this would query activity log tables
+	
+	return &pb.GetUserActivityResponse{
+		Success:    true,
+		Activities: []*pb.UserActivity{},
+		TotalCount: 0,
+	}, nil
+}
+
+// ListRoles implements ListRoles method for role management
+func (s *EnhancedAuthGRPCServer) ListRoles(ctx context.Context, req *pb.ListRolesRequest) (*pb.ListRolesResponse, error) {
+	// Validate input
+	if req.OrganizationId == "" {
+		return &pb.ListRolesResponse{
+			Success: false,
+			Error:   "Organization ID is required",
+		}, nil
+	}
+
+	// Parse organization ID
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.ListRolesResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	// Get roles from database
+	var roles []models.Role
+	if err := s.db.WithContext(ctx).Where("organization_id = ?", orgID).Preload("RolePermissions.Permission").Find(&roles).Error; err != nil {
+		s.logger.Error("Failed to list roles", zap.Error(err))
+		return &pb.ListRolesResponse{
+			Success: false,
+			Error:   "Failed to retrieve roles",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbRoles := make([]*pb.Role, len(roles))
+	for i, role := range roles {
+		permissions := make([]*pb.Permission, len(role.RolePermissions))
+		for j, rp := range role.RolePermissions {
+			permissions[j] = &pb.Permission{
+				Id:          rp.Permission.ID.String(),
+				Name:        rp.Permission.Name,
+				Resource:    rp.Permission.Resource,
+				Action:      rp.Permission.Action,
+				Scope:       rp.Permission.Scope,
+				Description: rp.Permission.Description,
+				IsSystem:    rp.Permission.IsSystem,
+				CreatedAt:   timestamppb.New(rp.Permission.CreatedAt),
+				UpdatedAt:   timestamppb.New(rp.Permission.UpdatedAt),
+			}
+		}
+
+		pbRoles[i] = &pb.Role{
+			Id:             role.ID.String(),
+			OrganizationId: role.OrganizationID.String(),
+			Name:           role.Name,
+			Description:    role.Description,
+			IsSystem:       role.IsSystem,
+			IsActive:       role.IsActive,
+			Permissions:    permissions,
+			CreatedAt:      timestamppb.New(role.CreatedAt),
+			UpdatedAt:      timestamppb.New(role.UpdatedAt),
+		}
+	}
+
+	return &pb.ListRolesResponse{
+		Success: true,
+		Roles:   pbRoles,
+	}, nil
+}
+
+// ListPermissions implements ListPermissions method for permission management
+func (s *EnhancedAuthGRPCServer) ListPermissions(ctx context.Context, req *pb.ListPermissionsRequest) (*pb.ListPermissionsResponse, error) {
+	// Get all permissions from database
+	var permissions []models.Permission
+	if err := s.db.WithContext(ctx).Find(&permissions).Error; err != nil {
+		s.logger.Error("Failed to list permissions", zap.Error(err))
+		return &pb.ListPermissionsResponse{
+			Success: false,
+			Error:   "Failed to retrieve permissions",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbPermissions := make([]*pb.Permission, len(permissions))
+	for i, perm := range permissions {
+		pbPermissions[i] = &pb.Permission{
+			Id:          perm.ID.String(),
+			Name:        perm.Name,
+			Resource:    perm.Resource,
+			Action:      perm.Action,
+			Scope:       perm.Scope,
+			Description: perm.Description,
+			IsSystem:    perm.IsSystem,
+			CreatedAt:   timestamppb.New(perm.CreatedAt),
+			UpdatedAt:   timestamppb.New(perm.UpdatedAt),
+		}
+	}
+
+	return &pb.ListPermissionsResponse{
+		Success:     true,
+		Permissions: pbPermissions,
+	}, nil
+}//
+ DeleteUser implements DeleteUser method for user management
+func (s *EnhancedAuthGRPCServer) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*pb.DeleteUserResponse, error) {
+	// Validate input
+	if req.UserId == "" {
+		return &pb.DeleteUserResponse{
+			Success: false,
+			Error:   "User ID is required",
+		}, nil
+	}
+
+	// Parse user ID
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.DeleteUserResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	// Check if user exists
+	var user models.User
+	if err := s.db.WithContext(ctx).First(&user, "id = ?", userID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return &pb.DeleteUserResponse{
+				Success: false,
+				Error:   "User not found",
+			}, nil
+		}
+		s.logger.Error("Failed to find user", zap.Error(err))
+		return &pb.DeleteUserResponse{
+			Success: false,
+			Error:   "Failed to find user",
+		}, nil
+	}
+
+	// Delete user (soft delete)
+	if err := s.db.WithContext(ctx).Delete(&user).Error; err != nil {
+		s.logger.Error("Failed to delete user", zap.Error(err))
+		return &pb.DeleteUserResponse{
+			Success: false,
+			Error:   "Failed to delete user",
+		}, nil
+	}
+
+	// Invalidate caches
+	s.invalidateUserCaches(ctx, userID, user.OrganizationID)
+
+	return &pb.DeleteUserResponse{
+		Success: true,
+	}, nil
+}
+
+// ActivateUser implements ActivateUser method for user management
+func (s *EnhancedAuthGRPCServer) ActivateUser(ctx context.Context, req *pb.ActivateUserRequest) (*pb.ActivateUserResponse, error) {
+	// Validate input
+	if req.UserId == "" {
+		return &pb.ActivateUserResponse{
+			Success: false,
+			Error:   "User ID is required",
+		}, nil
+	}
+
+	// Parse user ID
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.ActivateUserResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	// Update user status
+	var user models.User
+	if err := s.db.WithContext(ctx).First(&user, "id = ?", userID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return &pb.ActivateUserResponse{
+				Success: false,
+				Error:   "User not found",
+			}, nil
+		}
+		s.logger.Error("Failed to find user", zap.Error(err))
+		return &pb.ActivateUserResponse{
+			Success: false,
+			Error:   "Failed to find user",
+		}, nil
+	}
+
+	// Update user
+	user.IsActive = true
+	user.UpdatedAt = time.Now()
+	
+	if err := s.db.WithContext(ctx).Save(&user).Error; err != nil {
+		s.logger.Error("Failed to activate user", zap.Error(err))
+		return &pb.ActivateUserResponse{
+			Success: false,
+			Error:   "Failed to activate user",
+		}, nil
+	}
+
+	// Invalidate caches
+	s.invalidateUserCaches(ctx, userID, user.OrganizationID)
+
+	return &pb.ActivateUserResponse{
+		Success: true,
+		User:    s.convertUserToProto(&user),
+	}, nil
+}
+
+// DeactivateUser implements DeactivateUser method for user management
+func (s *EnhancedAuthGRPCServer) DeactivateUser(ctx context.Context, req *pb.DeactivateUserRequest) (*pb.DeactivateUserResponse, error) {
+	// Validate input
+	if req.UserId == "" {
+		return &pb.DeactivateUserResponse{
+			Success: false,
+			Error:   "User ID is required",
+		}, nil
+	}
+
+	// Parse user ID
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.DeactivateUserResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	// Update user status
+	var user models.User
+	if err := s.db.WithContext(ctx).First(&user, "id = ?", userID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return &pb.DeactivateUserResponse{
+				Success: false,
+				Error:   "User not found",
+			}, nil
+		}
+		s.logger.Error("Failed to find user", zap.Error(err))
+		return &pb.DeactivateUserResponse{
+			Success: false,
+			Error:   "Failed to find user",
+		}, nil
+	}
+
+	// Update user
+	user.IsActive = false
+	user.UpdatedAt = time.Now()
+	
+	if err := s.db.WithContext(ctx).Save(&user).Error; err != nil {
+		s.logger.Error("Failed to deactivate user", zap.Error(err))
+		return &pb.DeactivateUserResponse{
+			Success: false,
+			Error:   "Failed to deactivate user",
+		}, nil
+	}
+
+	// Invalidate caches
+	s.invalidateUserCaches(ctx, userID, user.OrganizationID)
+
+	return &pb.DeactivateUserResponse{
+		Success: true,
+		User:    s.convertUserToProto(&user),
+	}, nil
+}
+
+// VerifyUser implements VerifyUser method for user management
+func (s *EnhancedAuthGRPCServer) VerifyUser(ctx context.Context, req *pb.VerifyUserRequest) (*pb.VerifyUserResponse, error) {
+	// Validate input
+	if req.UserId == "" {
+		return &pb.VerifyUserResponse{
+			Success: false,
+			Error:   "User ID is required",
+		}, nil
+	}
+
+	// Parse user ID
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.VerifyUserResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	// Update user status
+	var user models.User
+	if err := s.db.WithContext(ctx).First(&user, "id = ?", userID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return &pb.VerifyUserResponse{
+				Success: false,
+				Error:   "User not found",
+			}, nil
+		}
+		s.logger.Error("Failed to find user", zap.Error(err))
+		return &pb.VerifyUserResponse{
+			Success: false,
+			Error:   "Failed to find user",
+		}, nil
+	}
+
+	// Update user
+	user.IsVerified = true
+	user.UpdatedAt = time.Now()
+	
+	if err := s.db.WithContext(ctx).Save(&user).Error; err != nil {
+		s.logger.Error("Failed to verify user", zap.Error(err))
+		return &pb.VerifyUserResponse{
+			Success: false,
+			Error:   "Failed to verify user",
+		}, nil
+	}
+
+	// Invalidate caches
+	s.invalidateUserCaches(ctx, userID, user.OrganizationID)
+
+	return &pb.VerifyUserResponse{
+		Success: true,
+		User:    s.convertUserToProto(&user),
+	}, nil
+}// Creat
+eRole implements CreateRole method for role management
+func (s *EnhancedAuthGRPCServer) CreateRole(ctx context.Context, req *pb.CreateRoleRequest) (*pb.CreateRoleResponse, error) {
+	// Validate input
+	if req.OrganizationId == "" || req.Name == "" {
+		return &pb.CreateRoleResponse{
+			Success: false,
+			Error:   "Organization ID and role name are required",
+		}, nil
+	}
+
+	// Parse organization ID
+	orgID, err := uuid.Parse(req.OrganizationId)
+	if err != nil {
+		return &pb.CreateRoleResponse{
+			Success: false,
+			Error:   "Invalid organization ID format",
+		}, nil
+	}
+
+	// Create role
+	role := models.Role{
+		ID:             uuid.New(),
+		OrganizationID: orgID,
+		Name:           req.Name,
+		Description:    req.Description,
+		IsSystem:       false,
+		IsActive:       true,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := s.db.WithContext(ctx).Create(&role).Error; err != nil {
+		s.logger.Error("Failed to create role", zap.Error(err))
+		return &pb.CreateRoleResponse{
+			Success: false,
+			Error:   "Failed to create role",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbRole := &pb.Role{
+		Id:             role.ID.String(),
+		OrganizationId: role.OrganizationID.String(),
+		Name:           role.Name,
+		Description:    role.Description,
+		IsSystem:       role.IsSystem,
+		IsActive:       role.IsActive,
+		Permissions:    []*pb.Permission{}, // Empty for new role
+		CreatedAt:      timestamppb.New(role.CreatedAt),
+		UpdatedAt:      timestamppb.New(role.UpdatedAt),
+	}
+
+	return &pb.CreateRoleResponse{
+		Success: true,
+		Role:    pbRole,
+	}, nil
+}
+
+// UpdateRole implements UpdateRole method for role management
+func (s *EnhancedAuthGRPCServer) UpdateRole(ctx context.Context, req *pb.UpdateRoleRequest) (*pb.UpdateRoleResponse, error) {
+	// Validate input
+	if req.RoleId == "" {
+		return &pb.UpdateRoleResponse{
+			Success: false,
+			Error:   "Role ID is required",
+		}, nil
+	}
+
+	// Parse role ID
+	roleID, err := uuid.Parse(req.RoleId)
+	if err != nil {
+		return &pb.UpdateRoleResponse{
+			Success: false,
+			Error:   "Invalid role ID format",
+		}, nil
+	}
+
+	// Find and update role
+	var role models.Role
+	if err := s.db.WithContext(ctx).First(&role, "id = ?", roleID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return &pb.UpdateRoleResponse{
+				Success: false,
+				Error:   "Role not found",
+			}, nil
+		}
+		s.logger.Error("Failed to find role", zap.Error(err))
+		return &pb.UpdateRoleResponse{
+			Success: false,
+			Error:   "Failed to find role",
+		}, nil
+	}
+
+	// Update fields
+	if req.Name != "" {
+		role.Name = req.Name
+	}
+	if req.Description != "" {
+		role.Description = req.Description
+	}
+	role.UpdatedAt = time.Now()
+
+	if err := s.db.WithContext(ctx).Save(&role).Error; err != nil {
+		s.logger.Error("Failed to update role", zap.Error(err))
+		return &pb.UpdateRoleResponse{
+			Success: false,
+			Error:   "Failed to update role",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbRole := &pb.Role{
+		Id:             role.ID.String(),
+		OrganizationId: role.OrganizationID.String(),
+		Name:           role.Name,
+		Description:    role.Description,
+		IsSystem:       role.IsSystem,
+		IsActive:       role.IsActive,
+		Permissions:    []*pb.Permission{}, // Would need to load permissions
+		CreatedAt:      timestamppb.New(role.CreatedAt),
+		UpdatedAt:      timestamppb.New(role.UpdatedAt),
+	}
+
+	return &pb.UpdateRoleResponse{
+		Success: true,
+		Role:    pbRole,
+	}, nil
+}
+
+// DeleteRole implements DeleteRole method for role management
+func (s *EnhancedAuthGRPCServer) DeleteRole(ctx context.Context, req *pb.DeleteRoleRequest) (*pb.DeleteRoleResponse, error) {
+	// Validate input
+	if req.RoleId == "" {
+		return &pb.DeleteRoleResponse{
+			Success: false,
+			Error:   "Role ID is required",
+		}, nil
+	}
+
+	// Parse role ID
+	roleID, err := uuid.Parse(req.RoleId)
+	if err != nil {
+		return &pb.DeleteRoleResponse{
+			Success: false,
+			Error:   "Invalid role ID format",
+		}, nil
+	}
+
+	// Check if role exists and is not system role
+	var role models.Role
+	if err := s.db.WithContext(ctx).First(&role, "id = ?", roleID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return &pb.DeleteRoleResponse{
+				Success: false,
+				Error:   "Role not found",
+			}, nil
+		}
+		s.logger.Error("Failed to find role", zap.Error(err))
+		return &pb.DeleteRoleResponse{
+			Success: false,
+			Error:   "Failed to find role",
+		}, nil
+	}
+
+	if role.IsSystem {
+		return &pb.DeleteRoleResponse{
+			Success: false,
+			Error:   "Cannot delete system role",
+		}, nil
+	}
+
+	// Delete role (soft delete)
+	if err := s.db.WithContext(ctx).Delete(&role).Error; err != nil {
+		s.logger.Error("Failed to delete role", zap.Error(err))
+		return &pb.DeleteRoleResponse{
+			Success: false,
+			Error:   "Failed to delete role",
+		}, nil
+	}
+
+	return &pb.DeleteRoleResponse{
+		Success: true,
+	}, nil
+}
+
+// AssignUserRole implements AssignUserRole method for role assignment
+func (s *EnhancedAuthGRPCServer) AssignUserRole(ctx context.Context, req *pb.AssignUserRoleRequest) (*pb.AssignUserRoleResponse, error) {
+	// Validate input
+	if req.UserId == "" || req.RoleId == "" {
+		return &pb.AssignUserRoleResponse{
+			Success: false,
+			Error:   "User ID and Role ID are required",
+		}, nil
+	}
+
+	// Parse IDs
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.AssignUserRoleResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	roleID, err := uuid.Parse(req.RoleId)
+	if err != nil {
+		return &pb.AssignUserRoleResponse{
+			Success: false,
+			Error:   "Invalid role ID format",
+		}, nil
+	}
+
+	// Check if assignment already exists
+	var existingAssignment models.UserRole
+	if err := s.db.WithContext(ctx).Where("user_id = ? AND role_id = ?", userID, roleID).First(&existingAssignment).Error; err == nil {
+		return &pb.AssignUserRoleResponse{
+			Success: false,
+			Error:   "User already has this role",
+		}, nil
+	}
+
+	// Create user role assignment
+	userRole := models.UserRole{
+		ID:        uuid.New(),
+		UserID:    userID,
+		RoleID:    roleID,
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.db.WithContext(ctx).Create(&userRole).Error; err != nil {
+		s.logger.Error("Failed to assign user role", zap.Error(err))
+		return &pb.AssignUserRoleResponse{
+			Success: false,
+			Error:   "Failed to assign role to user",
+		}, nil
+	}
+
+	return &pb.AssignUserRoleResponse{
+		Success: true,
+	}, nil
+}
+
+// RevokeUserRole implements RevokeUserRole method for role revocation
+func (s *EnhancedAuthGRPCServer) RevokeUserRole(ctx context.Context, req *pb.RevokeUserRoleRequest) (*pb.RevokeUserRoleResponse, error) {
+	// Validate input
+	if req.UserId == "" || req.RoleId == "" {
+		return &pb.RevokeUserRoleResponse{
+			Success: false,
+			Error:   "User ID and Role ID are required",
+		}, nil
+	}
+
+	// Parse IDs
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		return &pb.RevokeUserRoleResponse{
+			Success: false,
+			Error:   "Invalid user ID format",
+		}, nil
+	}
+
+	roleID, err := uuid.Parse(req.RoleId)
+	if err != nil {
+		return &pb.RevokeUserRoleResponse{
+			Success: false,
+			Error:   "Invalid role ID format",
+		}, nil
+	}
+
+	// Delete user role assignment
+	if err := s.db.WithContext(ctx).Where("user_id = ? AND role_id = ?", userID, roleID).Delete(&models.UserRole{}).Error; err != nil {
+		s.logger.Error("Failed to revoke user role", zap.Error(err))
+		return &pb.RevokeUserRoleResponse{
+			Success: false,
+			Error:   "Failed to revoke role from user",
+		}, nil
+	}
+
+	return &pb.RevokeUserRoleResponse{
+		Success: true,
+	}, nil
+}
+
+// AssignPermissions implements AssignPermissions method for permission assignment
+func (s *EnhancedAuthGRPCServer) AssignPermissions(ctx context.Context, req *pb.AssignPermissionsRequest) (*pb.AssignPermissionsResponse, error) {
+	// Validate input
+	if req.RoleId == "" || len(req.PermissionIds) == 0 {
+		return &pb.AssignPermissionsResponse{
+			Success: false,
+			Error:   "Role ID and permission IDs are required",
+		}, nil
+	}
+
+	// Parse role ID
+	roleID, err := uuid.Parse(req.RoleId)
+	if err != nil {
+		return &pb.AssignPermissionsResponse{
+			Success: false,
+			Error:   "Invalid role ID format",
+		}, nil
+	}
+
+	// Parse permission IDs
+	permissionIDs := make([]uuid.UUID, len(req.PermissionIds))
+	for i, permID := range req.PermissionIds {
+		parsedID, err := uuid.Parse(permID)
+		if err != nil {
+			return &pb.AssignPermissionsResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Invalid permission ID format: %s", permID),
+			}, nil
+		}
+		permissionIDs[i] = parsedID
+	}
+
+	// Remove existing permissions for this role
+	if err := s.db.WithContext(ctx).Where("role_id = ?", roleID).Delete(&models.RolePermission{}).Error; err != nil {
+		s.logger.Error("Failed to remove existing permissions", zap.Error(err))
+		return &pb.AssignPermissionsResponse{
+			Success: false,
+			Error:   "Failed to update role permissions",
+		}, nil
+	}
+
+	// Add new permissions
+	for _, permID := range permissionIDs {
+		rolePermission := models.RolePermission{
+			ID:           uuid.New(),
+			RoleID:       roleID,
+			PermissionID: permID,
+			CreatedAt:    time.Now(),
+		}
+
+		if err := s.db.WithContext(ctx).Create(&rolePermission).Error; err != nil {
+			s.logger.Error("Failed to assign permission", zap.Error(err))
+			return &pb.AssignPermissionsResponse{
+				Success: false,
+				Error:   "Failed to assign permissions to role",
+			}, nil
+		}
+	}
+
+	return &pb.AssignPermissionsResponse{
+		Success: true,
+	}, nil
+}
+
+// BulkDeleteUsers implements BulkDeleteUsers method for bulk operations
+func (s *EnhancedAuthGRPCServer) BulkDeleteUsers(ctx context.Context, req *pb.BulkDeleteUsersRequest) (*pb.BulkDeleteUsersResponse, error) {
+	if len(req.UserIds) == 0 {
+		return &pb.BulkDeleteUsersResponse{
+			Success: false,
+			Error:   "User IDs list is required",
+		}, nil
+	}
+
+	results := make([]*pb.BulkDeleteResult, len(req.UserIds))
+	deletedCount := int32(0)
+	failedCount := int32(0)
+
+	for i, userIDStr := range req.UserIds {
+		userID, err := uuid.Parse(userIDStr)
+		if err != nil {
+			results[i] = &pb.BulkDeleteResult{
+				Success: false,
+				UserId:  userIDStr,
+				Error:   "Invalid user ID format",
+			}
+			failedCount++
+			continue
+		}
+
+		// Delete user
+		if err := s.db.WithContext(ctx).Delete(&models.User{}, "id = ?", userID).Error; err != nil {
+			results[i] = &pb.BulkDeleteResult{
+				Success: false,
+				UserId:  userIDStr,
+				Error:   "Failed to delete user",
+			}
+			failedCount++
+		} else {
+			results[i] = &pb.BulkDeleteResult{
+				Success: true,
+				UserId:  userIDStr,
+			}
+			deletedCount++
+		}
+	}
+
+	return &pb.BulkDeleteUsersResponse{
+		Success:      deletedCount > 0,
+		DeletedCount: deletedCount,
+		FailedCount:  failedCount,
+		Results:      results,
+	}, nil
+}
