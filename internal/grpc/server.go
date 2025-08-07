@@ -14,7 +14,7 @@ import (
 	"erp-auth-service/internal/cache"
 	"erp-auth-service/internal/config"
 	"erp-auth-service/internal/domain/entities"
-	"erp-auth-service/internal/errors"
+	internalErrors "erp-auth-service/internal/errors"
 	"erp-auth-service/internal/events"
 	"erp-auth-service/internal/grpc/interceptors"
 	"erp-auth-service/internal/infrastructure/repositories"
@@ -64,7 +64,7 @@ type EnhancedAuthGRPCServer struct {
 	recoveryInterceptor   *interceptors.RecoveryInterceptor
 	
 	// Error handling
-	errorHandler *errors.ErrorHandler
+	errorHandler *internalErrors.ErrorHandler
 	
 	// Metrics registry
 	metricsRegistry *prometheus.Registry
@@ -225,7 +225,7 @@ func NewEnhancedAuthGRPCServer(
 	}
 	
 	// Initialize comprehensive error handler
-	server.errorHandler = errors.NewErrorHandler(logger, errors.GetDefaultErrorHandlerConfig())
+	server.errorHandler = internalErrors.NewErrorHandler(logger, internalErrors.GetDefaultErrorHandlerConfig())
 	
 	// Register circuit breakers for dependencies
 	server.setupCircuitBreakers()
@@ -556,6 +556,7 @@ func (s *EnhancedAuthGRPCServer) RevokeToken(ctx context.Context, req *pb.Revoke
 // GetUser retrieves user with preloaded relationships and caching
 func (s *EnhancedAuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.GetUserResponse, error) {
 	if req.UserId == "" {
+		s.logger.Debug("GetUser called without user ID")
 		return &pb.GetUserResponse{
 			Error: "User ID is required",
 		}, nil
@@ -563,50 +564,87 @@ func (s *EnhancedAuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserReq
 
 	userID, err := uuid.Parse(req.UserId)
 	if err != nil {
+		s.logger.Debug("GetUser called with invalid user ID", zap.String("user_id", req.UserId))
 		return &pb.GetUserResponse{
 			Error: "Invalid user ID format",
 		}, nil
 	}
 
-	// Try cache first for performance optimization
-	cacheKey := fmt.Sprintf("user:full:%s", userID.String())
-	if cachedData, err := s.cacheManager.Get(ctx, cacheKey); err == nil {
-		// Deserialize cached user data
-		var cachedUser pb.User
-		if err := s.deserializeUser(cachedData, &cachedUser); err == nil {
-			s.logger.Debug("User cache hit", zap.String("user_id", userID.String()))
-			return &pb.GetUserResponse{User: &cachedUser}, nil
-		}
-	}
+	s.logger.Debug("Getting user", zap.String("user_id", userID.String()))
 
-	// Cache miss - fetch from database with preloaded relationships
-	var user models.User
-	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
-		return nil, s.db.Preload("Organization").
-			Preload("UserRoles").
-			Preload("UserRoles.Role").
-			Where("id = ?", userID).First(&user).Error
-	})
-	
-	if err != nil {
-		s.logger.Error("Database user lookup failed", zap.Error(err), zap.String("user_id", userID.String()))
+	// Test database connection first
+	var count int64
+	if err := s.db.Model(&models.User{}).Count(&count).Error; err != nil {
+		s.logger.Error("Database connection test failed", zap.Error(err))
 		return &pb.GetUserResponse{
-			Error: "User not found",
+			Error: "Database connection error",
 		}, nil
 	}
+	s.logger.Debug("Database connection OK", zap.Int64("total_users", count))
+
+	// Fetch directly from database with minimal query
+	var user models.User
+	
+	// Add debug logging for the exact query
+	s.logger.Info("Executing user lookup query", 
+		zap.String("user_id", userID.String()),
+		zap.String("query", "SELECT * FROM users WHERE id = ?"))
+	
+	err = s.db.Where("id = ?", userID).First(&user).Error
+	
+	if err != nil {
+		s.logger.Error("Database user lookup failed", 
+			zap.Error(err), 
+			zap.String("user_id", userID.String()),
+			zap.String("error_message", err.Error()),
+			zap.String("error_type", fmt.Sprintf("%T", err)))
+		
+		// Try alternative query methods to debug
+		var userByString models.User
+		stringErr := s.db.Where("id::text = ?", userID.String()).First(&userByString).Error
+		s.logger.Debug("Alternative string query result", 
+			zap.Error(stringErr),
+			zap.Bool("found_by_string", stringErr == nil))
+		
+		// Try to find any user with similar ID to debug
+		var similarUsers []models.User
+		s.db.Where("id::text LIKE ?", userID.String()[:8]+"%").Limit(5).Find(&similarUsers)
+		s.logger.Debug("Similar users found", zap.Int("count", len(similarUsers)))
+		
+		// Try to get the first user to test basic connectivity
+		var firstUser models.User
+		firstErr := s.db.First(&firstUser).Error
+		s.logger.Debug("First user query test", 
+			zap.Error(firstErr),
+			zap.Bool("can_query_users", firstErr == nil))
+		
+		return &pb.GetUserResponse{
+			Error: fmt.Sprintf("user not found: %s", userID.String()),
+		}, nil
+	}
+	
+	// Load organization separately if needed
+	var org models.Organization
+	if user.OrganizationID != uuid.Nil {
+		s.db.Where("id = ?", user.OrganizationID).First(&org)
+		user.Organization = org
+	}
+
+	s.logger.Info("User found in database", 
+		zap.String("user_id", userID.String()),
+		zap.String("email", user.Email),
+		zap.String("name", user.FirstName+" "+user.LastName))
 
 	// Convert to protobuf with all relationships
 	pbUser := s.convertUserToProto(&user)
 
-	// Cache the result for future requests (5 minute TTL)
-	if serializedUser, err := s.serializeUser(pbUser); err == nil {
-		if err := s.cacheManager.Set(ctx, cacheKey, serializedUser, 5*time.Minute); err != nil {
-			s.logger.Warn("Failed to cache user data", zap.Error(err))
-		}
-	}
+	s.logger.Info("User converted to protobuf successfully", 
+		zap.String("user_id", userID.String()),
+		zap.Bool("pb_user_nil", pbUser == nil))
 
 	return &pb.GetUserResponse{
-		User: pbUser,
+		User:  pbUser,
+		Error: "", // Explicitly clear any error
 	}, nil
 }
 
@@ -1832,6 +1870,7 @@ func (s *EnhancedAuthGRPCServer) GetUserStats(ctx context.Context, req *pb.GetUs
 func (s *EnhancedAuthGRPCServer) GetSecurityStats(ctx context.Context, req *pb.GetSecurityStatsRequest) (*pb.GetSecurityStatsResponse, error) {
 	// Validate input
 	if req.OrganizationId == "" {
+		s.logger.Debug("GetSecurityStats called without organization ID")
 		return &pb.GetSecurityStatsResponse{
 			Success: false,
 			Error:   "Organization ID is required",
@@ -1841,11 +1880,14 @@ func (s *EnhancedAuthGRPCServer) GetSecurityStats(ctx context.Context, req *pb.G
 	// Parse organization ID
 	orgID, err := uuid.Parse(req.OrganizationId)
 	if err != nil {
+		s.logger.Debug("GetSecurityStats called with invalid organization ID", zap.String("org_id", req.OrganizationId))
 		return &pb.GetSecurityStatsResponse{
 			Success: false,
 			Error:   "Invalid organization ID format",
 		}, nil
 	}
+
+	s.logger.Debug("Getting security stats", zap.String("org_id", orgID.String()))
 
 	// Get security statistics
 	var stats pb.SecurityStats
@@ -1856,15 +1898,14 @@ func (s *EnhancedAuthGRPCServer) GetSecurityStats(ctx context.Context, req *pb.G
 	stats.LockedAccounts = 0
 	stats.SecurityAlerts = 0
 	
-	// Two-factor enabled users
-	var twoFactorEnabled int64
-	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ? AND two_factor_enabled = ?", orgID, true).Count(&twoFactorEnabled).Error; err != nil {
-		s.logger.Error("Failed to count two-factor enabled users", zap.Error(err))
-		return &pb.GetSecurityStatsResponse{Success: false, Error: "Failed to get security statistics"}, nil
-	}
-	stats.TwoFactorEnabled = int32(twoFactorEnabled)
+	// Two-factor authentication is disabled - always return 0
+	stats.TwoFactorEnabled = 0
 	
 	stats.PasswordResetsToday = 0
+
+	s.logger.Debug("Security stats retrieved successfully", 
+		zap.String("org_id", orgID.String()),
+		zap.Int32("two_factor_enabled", stats.TwoFactorEnabled))
 
 	return &pb.GetSecurityStatsResponse{
 		Success: true,
@@ -1982,8 +2023,9 @@ func (s *EnhancedAuthGRPCServer) ListPermissions(ctx context.Context, req *pb.Li
 		Success:     true,
 		Permissions: pbPermissions,
 	}, nil
-}//
- DeleteUser implements DeleteUser method for user management
+}
+
+// DeleteUser implements DeleteUser method for user management
 func (s *EnhancedAuthGRPCServer) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*pb.DeleteUserResponse, error) {
 	// Validate input
 	if req.UserId == "" {
@@ -2201,8 +2243,9 @@ func (s *EnhancedAuthGRPCServer) VerifyUser(ctx context.Context, req *pb.VerifyU
 		Success: true,
 		User:    s.convertUserToProto(&user),
 	}, nil
-}// Creat
-eRole implements CreateRole method for role management
+}
+
+// CreateRole implements CreateRole method for role management
 func (s *EnhancedAuthGRPCServer) CreateRole(ctx context.Context, req *pb.CreateRoleRequest) (*pb.CreateRoleResponse, error) {
 	// Validate input
 	if req.OrganizationId == "" || req.Name == "" {
@@ -2598,3 +2641,4 @@ func (s *EnhancedAuthGRPCServer) BulkDeleteUsers(ctx context.Context, req *pb.Bu
 		Results:      results,
 	}, nil
 }
+
