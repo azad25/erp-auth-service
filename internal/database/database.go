@@ -93,10 +93,10 @@ func configureConnectionPool(db *gorm.DB, cfg config.DatabaseConfig) error {
 	}
 
 	// Connection pool configuration for high-performance scenarios
-	sqlDB.SetMaxOpenConns(100)                 // Maximum number of open connections
-	sqlDB.SetMaxIdleConns(25)                  // Maximum number of idle connections
-	sqlDB.SetConnMaxLifetime(5 * time.Minute)  // Maximum connection lifetime
-	sqlDB.SetConnMaxIdleTime(1 * time.Minute)  // Maximum idle time
+	sqlDB.SetMaxOpenConns(50)                  // Reduced from 100 to 50 for better stability
+	sqlDB.SetMaxIdleConns(10)                  // Reduced from 25 to 10
+	sqlDB.SetConnMaxLifetime(10 * time.Minute) // Increased from 5 to 10 minutes
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)  // Increased from 1 to 5 minutes
 
 	// Test the connection
 	if err := sqlDB.Ping(); err != nil {

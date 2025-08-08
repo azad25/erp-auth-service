@@ -56,6 +56,8 @@ type AuthServiceClient interface {
 	// Organization operations
 	CreateOrganization(ctx context.Context, in *CreateOrganizationRequest, opts ...grpc.CallOption) (*CreateOrganizationResponse, error)
 	GetOrganization(ctx context.Context, in *GetOrganizationRequest, opts ...grpc.CallOption) (*GetOrganizationResponse, error)
+	ListOrganizations(ctx context.Context, in *ListOrganizationsRequest, opts ...grpc.CallOption) (*ListOrganizationsResponse, error)
+	GetOrganizationStats(ctx context.Context, in *GetOrganizationStatsRequest, opts ...grpc.CallOption) (*GetOrganizationStatsResponse, error)
 	// Bulk operations
 	BulkCreateUsers(ctx context.Context, in *BulkCreateUsersRequest, opts ...grpc.CallOption) (*BulkCreateUsersResponse, error)
 	BulkUpdateUsers(ctx context.Context, in *BulkUpdateUsersRequest, opts ...grpc.CallOption) (*BulkUpdateUsersResponse, error)
@@ -316,6 +318,24 @@ func (c *authServiceClient) GetOrganization(ctx context.Context, in *GetOrganiza
 	return out, nil
 }
 
+func (c *authServiceClient) ListOrganizations(ctx context.Context, in *ListOrganizationsRequest, opts ...grpc.CallOption) (*ListOrganizationsResponse, error) {
+	out := new(ListOrganizationsResponse)
+	err := c.cc.Invoke(ctx, "/auth.AuthService/ListOrganizations", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *authServiceClient) GetOrganizationStats(ctx context.Context, in *GetOrganizationStatsRequest, opts ...grpc.CallOption) (*GetOrganizationStatsResponse, error) {
+	out := new(GetOrganizationStatsResponse)
+	err := c.cc.Invoke(ctx, "/auth.AuthService/GetOrganizationStats", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *authServiceClient) BulkCreateUsers(ctx context.Context, in *BulkCreateUsersRequest, opts ...grpc.CallOption) (*BulkCreateUsersResponse, error) {
 	out := new(BulkCreateUsersResponse)
 	err := c.cc.Invoke(ctx, "/auth.AuthService/BulkCreateUsers", in, out, opts...)
@@ -399,6 +419,8 @@ type AuthServiceServer interface {
 	// Organization operations
 	CreateOrganization(context.Context, *CreateOrganizationRequest) (*CreateOrganizationResponse, error)
 	GetOrganization(context.Context, *GetOrganizationRequest) (*GetOrganizationResponse, error)
+	ListOrganizations(context.Context, *ListOrganizationsRequest) (*ListOrganizationsResponse, error)
+	GetOrganizationStats(context.Context, *GetOrganizationStatsRequest) (*GetOrganizationStatsResponse, error)
 	// Bulk operations
 	BulkCreateUsers(context.Context, *BulkCreateUsersRequest) (*BulkCreateUsersResponse, error)
 	BulkUpdateUsers(context.Context, *BulkUpdateUsersRequest) (*BulkUpdateUsersResponse, error)
@@ -493,6 +515,12 @@ func (UnimplementedAuthServiceServer) CreateOrganization(context.Context, *Creat
 }
 func (UnimplementedAuthServiceServer) GetOrganization(context.Context, *GetOrganizationRequest) (*GetOrganizationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetOrganization not implemented")
+}
+func (UnimplementedAuthServiceServer) ListOrganizations(context.Context, *ListOrganizationsRequest) (*ListOrganizationsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListOrganizations not implemented")
+}
+func (UnimplementedAuthServiceServer) GetOrganizationStats(context.Context, *GetOrganizationStatsRequest) (*GetOrganizationStatsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetOrganizationStats not implemented")
 }
 func (UnimplementedAuthServiceServer) BulkCreateUsers(context.Context, *BulkCreateUsersRequest) (*BulkCreateUsersResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BulkCreateUsers not implemented")
@@ -1008,6 +1036,42 @@ func _AuthService_GetOrganization_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AuthService_ListOrganizations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListOrganizationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuthServiceServer).ListOrganizations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/auth.AuthService/ListOrganizations",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuthServiceServer).ListOrganizations(ctx, req.(*ListOrganizationsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AuthService_GetOrganizationStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetOrganizationStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuthServiceServer).GetOrganizationStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/auth.AuthService/GetOrganizationStats",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuthServiceServer).GetOrganizationStats(ctx, req.(*GetOrganizationStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _AuthService_BulkCreateUsers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BulkCreateUsersRequest)
 	if err := dec(in); err != nil {
@@ -1212,6 +1276,14 @@ var AuthService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetOrganization",
 			Handler:    _AuthService_GetOrganization_Handler,
+		},
+		{
+			MethodName: "ListOrganizations",
+			Handler:    _AuthService_ListOrganizations_Handler,
+		},
+		{
+			MethodName: "GetOrganizationStats",
+			Handler:    _AuthService_GetOrganizationStats_Handler,
 		},
 		{
 			MethodName: "BulkCreateUsers",

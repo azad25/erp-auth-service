@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -22,11 +21,6 @@ import (
 )
 
 func main() {
-	// Parse command line flags
-	seedFlag := flag.Bool("seed", false, "Run database seeding")
-	seedMinimal := flag.Bool("seed-minimal", false, "Run minimal database seeding")
-	flag.Parse()
-
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment variables")
@@ -59,30 +53,6 @@ func main() {
 	}
 
 	logger.Info(ctx, "Database initialized successfully", nil)
-
-	// Handle seeding if requested via command line flags
-	if *seedFlag || *seedMinimal {
-		s := seeder.NewSeeder(db.GetWriteDB())
-		
-		if *seedMinimal {
-			logger.Info(ctx, "Running minimal database seeding", nil)
-			if err := s.SeedMinimal(); err != nil {
-				logger.Fatal(ctx, "Failed to run minimal seeding", map[string]interface{}{
-					"error": err.Error(),
-				})
-			}
-		} else {
-			logger.Info(ctx, "Running full database seeding", nil)
-			if err := s.SeedAll(); err != nil {
-				logger.Fatal(ctx, "Failed to run full seeding", map[string]interface{}{
-					"error": err.Error(),
-				})
-			}
-		}
-		
-		logger.Info(ctx, "Seeding completed, exiting", nil)
-		return
-	}
 
 	// Seed database with initial data on startup (if not already seeded)
 	seederInstance := seeder.NewSeeder(db.GetWriteDB())
@@ -122,14 +92,14 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		
+
 		// Initialize router with Kafka producer
 		r := router.Initialize(db.GetWriteDB(), redisClient, cfg, kafkaProducer)
 
 		logger.Info(ctx, "Starting HTTP server", map[string]interface{}{
 			"port": cfg.Server.Port,
 		})
-		
+
 		if err := r.Run(":" + cfg.Server.Port); err != nil {
 			logger.Error(ctx, "HTTP server error", map[string]interface{}{
 				"error": err.Error(),
@@ -141,13 +111,13 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		
+
 		grpcSrv := grpcServer.NewAuthGRPCServer(db.GetWriteDB(), redisClient, cfg)
-		
+
 		logger.Info(ctx, "Starting gRPC server", map[string]interface{}{
 			"port": cfg.GRPC.Port,
 		})
-		
+
 		if err := grpcSrv.Start(); err != nil {
 			logger.Error(ctx, "gRPC server error", map[string]interface{}{
 				"error": err.Error(),

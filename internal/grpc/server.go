@@ -1023,6 +1023,130 @@ func (s *EnhancedAuthGRPCServer) GetOrganization(ctx context.Context, req *pb.Ge
 	}, nil
 }
 
+// ListOrganizations implements ListOrganizations method
+func (s *EnhancedAuthGRPCServer) ListOrganizations(ctx context.Context, req *pb.ListOrganizationsRequest) (*pb.ListOrganizationsResponse, error) {
+	// Set defaults
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Get organizations from database
+	var organizations []models.Organization
+	query := s.db.WithContext(ctx).Model(&models.Organization{})
+
+	// Add search filter if provided
+	if req.Search != "" {
+		query = query.Where("name ILIKE ? OR domain ILIKE ?", "%"+req.Search+"%", "%"+req.Search+"%")
+	}
+
+	// Add sorting
+	sortBy := req.SortBy
+	if sortBy == "" {
+		sortBy = "created_at"
+	}
+	sortOrder := req.SortOrder
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
+	query = query.Order(fmt.Sprintf("%s %s", sortBy, sortOrder))
+
+	// Get total count
+	var totalCount int64
+	if err := query.Count(&totalCount).Error; err != nil {
+		s.logger.Error("Failed to count organizations", zap.Error(err))
+		return &pb.ListOrganizationsResponse{
+			Success: false,
+			Error:   "Failed to count organizations",
+		}, nil
+	}
+
+	// Get paginated results
+	if err := query.Limit(int(limit)).Offset(int(offset)).Find(&organizations).Error; err != nil {
+		s.logger.Error("Failed to list organizations", zap.Error(err))
+		return &pb.ListOrganizationsResponse{
+			Success: false,
+			Error:   "Failed to list organizations",
+		}, nil
+	}
+
+	// Convert to protobuf
+	pbOrgs := make([]*pb.Organization, len(organizations))
+	for i, org := range organizations {
+		pbOrgs[i] = s.convertOrganizationToProto(&org)
+	}
+
+	hasNextPage := int64(offset+int32(len(organizations))) < totalCount
+
+	return &pb.ListOrganizationsResponse{
+		Success:       true,
+		Organizations: pbOrgs,
+		TotalCount:    int32(totalCount),
+		HasNextPage:   hasNextPage,
+	}, nil
+}
+
+// GetOrganizationStats implements GetOrganizationStats method
+func (s *EnhancedAuthGRPCServer) GetOrganizationStats(ctx context.Context, req *pb.GetOrganizationStatsRequest) (*pb.GetOrganizationStatsResponse, error) {
+	// Get organization statistics
+	var totalOrgs, activeOrgs, inactiveOrgs int64
+	var totalUsers int64
+
+	// Total organizations
+	if err := s.db.WithContext(ctx).Model(&models.Organization{}).Count(&totalOrgs).Error; err != nil {
+		s.logger.Error("Failed to count total organizations", zap.Error(err))
+		return &pb.GetOrganizationStatsResponse{
+			Success: false,
+			Error:   "Failed to get organization statistics",
+		}, nil
+	}
+
+	// Active organizations
+	if err := s.db.WithContext(ctx).Model(&models.Organization{}).Where("is_active = ?", true).Count(&activeOrgs).Error; err != nil {
+		s.logger.Error("Failed to count active organizations", zap.Error(err))
+		return &pb.GetOrganizationStatsResponse{
+			Success: false,
+			Error:   "Failed to get organization statistics",
+		}, nil
+	}
+
+	inactiveOrgs = totalOrgs - activeOrgs
+
+	// Total users across all organizations
+	if err := s.db.WithContext(ctx).Model(&models.User{}).Count(&totalUsers).Error; err != nil {
+		s.logger.Error("Failed to count total users", zap.Error(err))
+		return &pb.GetOrganizationStatsResponse{
+			Success: false,
+			Error:   "Failed to get organization statistics",
+		}, nil
+	}
+
+	// Calculate average users per organization
+	var averageUsersPerOrg float32
+	if totalOrgs > 0 {
+		averageUsersPerOrg = float32(totalUsers) / float32(totalOrgs)
+	}
+
+	stats := &pb.OrganizationStats{
+		TotalOrganizations:      int32(totalOrgs),
+		ActiveOrganizations:     int32(activeOrgs),
+		InactiveOrganizations:   int32(inactiveOrgs),
+		VerifiedOrganizations:   int32(activeOrgs), // Assuming active = verified for now
+		UnverifiedOrganizations: int32(inactiveOrgs),
+		TotalUsers:              int32(totalUsers),
+		AverageUsersPerOrg:      averageUsersPerOrg,
+	}
+
+	return &pb.GetOrganizationStatsResponse{
+		Success: true,
+		Stats:   stats,
+	}, nil
+}
+
 // BulkCreateUsers implements bulk user creation for high-throughput scenarios
 func (s *EnhancedAuthGRPCServer) BulkCreateUsers(ctx context.Context, req *pb.BulkCreateUsersRequest) (*pb.BulkCreateUsersResponse, error) {
 	if req.OrganizationId == "" || len(req.Users) == 0 {
@@ -1399,13 +1523,80 @@ func (s *EnhancedAuthGRPCServer) publishUserCreatedEvent(ctx context.Context, us
 
 // convertOrganizationToProto converts a models.Organization to pb.Organization
 func (s *EnhancedAuthGRPCServer) convertOrganizationToProto(org *models.Organization) *pb.Organization {
-	return &pb.Organization{
+	pbOrg := &pb.Organization{
 		Id:        org.ID.String(),
 		Name:      org.Name,
 		Domain:    org.Domain,
 		IsActive:  org.IsActive,
 		CreatedAt: timestamppb.New(org.CreatedAt),
 		UpdatedAt: timestamppb.New(org.UpdatedAt),
+	}
+
+	// Convert users if loaded
+	if len(org.Users) > 0 {
+		pbOrg.Users = make([]*pb.User, len(org.Users))
+		for i, user := range org.Users {
+			pbOrg.Users[i] = s.convertUserToProto(&user)
+		}
+	}
+
+	// Set user counts
+	pbOrg.UserCount = int32(len(org.Users))
+	activeCount := int32(0)
+	for _, user := range org.Users {
+		if user.IsActive {
+			activeCount++
+		}
+	}
+	pbOrg.ActiveUserCount = activeCount
+
+	// Convert roles if loaded
+	if len(org.Roles) > 0 {
+		pbOrg.Roles = make([]*pb.Role, len(org.Roles))
+		for i, role := range org.Roles {
+			pbOrg.Roles[i] = s.convertRoleToProto(&role)
+		}
+	}
+
+	return pbOrg
+}
+
+// convertRoleToProto converts a models.Role to pb.Role
+func (s *EnhancedAuthGRPCServer) convertRoleToProto(role *models.Role) *pb.Role {
+	pbRole := &pb.Role{
+		Id:             role.ID.String(),
+		OrganizationId: role.OrganizationID.String(),
+		Name:           role.Name,
+		Description:    role.Description,
+		IsSystem:       role.IsSystem,
+		IsActive:       role.IsActive,
+		CreatedAt:      timestamppb.New(role.CreatedAt),
+		UpdatedAt:      timestamppb.New(role.UpdatedAt),
+	}
+
+	// Convert permissions if loaded through RolePermissions
+	if len(role.RolePermissions) > 0 {
+		pbRole.Permissions = make([]*pb.Permission, len(role.RolePermissions))
+		for i, rolePermission := range role.RolePermissions {
+			pbRole.Permissions[i] = s.convertPermissionToProto(&rolePermission.Permission)
+		}
+	}
+
+	return pbRole
+}
+
+// convertPermissionToProto converts a models.Permission to pb.Permission
+func (s *EnhancedAuthGRPCServer) convertPermissionToProto(perm *models.Permission) *pb.Permission {
+	return &pb.Permission{
+		Id:          perm.ID.String(),
+		Name:        perm.Name,
+		Description: perm.Description,
+		Resource:    perm.Resource,
+		Action:      perm.Action,
+		Scope:       perm.Scope,
+		IsSystem:    perm.IsSystem,
+		CreatedAt:   timestamppb.New(perm.CreatedAt),
+		UpdatedAt:   timestamppb.New(perm.UpdatedAt),
 	}
 }
 
@@ -1708,14 +1899,6 @@ func (k *KafkaEventPublisher) PublishPasswordChanged(ctx context.Context, data e
 
 // ListUsers implements ListUsers method for user management
 func (s *EnhancedAuthGRPCServer) ListUsers(ctx context.Context, req *pb.ListUsersRequest) (*pb.ListUsersResponse, error) {
-	// Validate input
-	if req.OrganizationId == "" {
-		return &pb.ListUsersResponse{
-			Success: false,
-			Error:   "Organization ID is required",
-		}, nil
-	}
-
 	// Set defaults
 	limit := req.Limit
 	if limit <= 0 {
@@ -1726,21 +1909,25 @@ func (s *EnhancedAuthGRPCServer) ListUsers(ctx context.Context, req *pb.ListUser
 		offset = 0
 	}
 
-	// Parse organization ID
-	orgID, err := uuid.Parse(req.OrganizationId)
-	if err != nil {
-		return &pb.ListUsersResponse{
-			Success: false,
-			Error:   "Invalid organization ID format",
-		}, nil
-	}
-
 	// Get users from database
 	var users []models.User
 	var totalCount int64
 
-	// Build query
-	query := s.db.WithContext(ctx).Where("organization_id = ?", orgID)
+	// Build query - if OrganizationId is empty, list all users (for app admins)
+	query := s.db.WithContext(ctx)
+	
+	if req.OrganizationId != "" {
+		// Parse organization ID for organization-specific queries
+		orgID, err := uuid.Parse(req.OrganizationId)
+		if err != nil {
+			return &pb.ListUsersResponse{
+				Success: false,
+				Error:   "Invalid organization ID format",
+			}, nil
+		}
+		query = query.Where("organization_id = ?", orgID)
+	}
+	// If OrganizationId is empty, query all users (no WHERE clause for organization)
 	
 	// Add search filter if provided
 	if req.Search != "" {

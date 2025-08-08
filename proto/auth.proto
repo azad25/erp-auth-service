@@ -48,6 +48,8 @@ service AuthService {
   // Organization operations
   rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
   rpc GetOrganization(GetOrganizationRequest) returns (GetOrganizationResponse);
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+  rpc GetOrganizationStats(GetOrganizationStatsRequest) returns (GetOrganizationStatsResponse);
   
   // Bulk operations
   rpc BulkCreateUsers(BulkCreateUsersRequest) returns (BulkCreateUsersResponse);
@@ -183,6 +185,10 @@ message Organization {
   bool is_active = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+  repeated User users = 7;
+  int32 user_count = 8;
+  int32 active_user_count = 9;
+  repeated Role roles = 10;
 }
 
 // User management messages
@@ -260,6 +266,41 @@ message GetOrganizationRequest {
 message GetOrganizationResponse {
   Organization organization = 1;
   string error = 2;
+}
+
+message ListOrganizationsRequest {
+  int32 limit = 1;
+  int32 offset = 2;
+  string search = 3;
+  string sort_by = 4;
+  string sort_order = 5;
+}
+
+message ListOrganizationsResponse {
+  bool success = 1;
+  repeated Organization organizations = 2;
+  int32 total_count = 3;
+  bool has_next_page = 4;
+  string error = 5;
+}
+
+message GetOrganizationStatsRequest {
+}
+
+message GetOrganizationStatsResponse {
+  bool success = 1;
+  OrganizationStats stats = 2;
+  string error = 3;
+}
+
+message OrganizationStats {
+  int32 total_organizations = 1;
+  int32 active_organizations = 2;
+  int32 inactive_organizations = 3;
+  int32 verified_organizations = 4;
+  int32 unverified_organizations = 5;
+  int32 total_users = 6;
+  float average_users_per_org = 7;
 }
 
 message OrganizationSettings {

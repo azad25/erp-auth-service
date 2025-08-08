@@ -71,6 +71,20 @@ func (s *Seeder) seedOrganizations() ([]models.Organization, error) {
 
 	organizations := []models.Organization{
 		{
+			Name:   "UniBASE ERP Solutions",
+			Domain: "unibaseerp.com",
+			Settings: models.Settings{
+				Timezone:         "UTC",
+				DateFormat:       "YYYY-MM-DD",
+				Currency:         "USD",
+				Language:         "en",
+				TwoFactorEnabled: true,
+				SessionTimeout:   3600,
+				CustomFields:     map[string]string{"industry": "Technology"},
+			},
+			IsActive: true,
+		},
+		{
 			Name:   "TechCorp Solutions",
 			Domain: "techcorp.com",
 			Settings: models.Settings{
@@ -242,8 +256,13 @@ func (s *Seeder) seedPermissions() ([]models.Permission, error) {
 		// Organization Management
 		{Name: "organizations.create", Resource: "organizations", Action: "create", Description: "Create organizations"},
 		{Name: "organizations.read", Resource: "organizations", Action: "read", Description: "View organization information"},
+		{Name: "organizations.read_all", Resource: "organizations", Action: "read_all", Description: "View all organizations (app admin only)"},
 		{Name: "organizations.update", Resource: "organizations", Action: "update", Description: "Update organization settings"},
 		{Name: "organizations.delete", Resource: "organizations", Action: "delete", Description: "Delete organizations"},
+
+		// User Management Permissions
+		{Name: "users.manage", Resource: "users", Action: "manage", Description: "Manage users within organization"},
+		{Name: "users.read_all", Resource: "users", Action: "read_all", Description: "View all users across organizations (app admin only)"},
 
 		// CRM Module
 		{Name: "crm.contacts.create", Resource: "crm.contacts", Action: "create", Description: "Create CRM contacts"},
@@ -362,10 +381,24 @@ func (s *Seeder) seedRolePermissions(roles []models.Role, permissions []models.P
 	// Define role permission mappings
 	rolePermissionMap := map[string][]string{
 		"Super Admin": {
-			// All permissions for super admin
+			// All permissions for super admin (app admin)
+			"users.create", "users.read", "users.update", "users.delete", "users.list", "users.manage", "users.read_all",
+			"roles.create", "roles.read", "roles.update", "roles.delete", "roles.list", "roles.assign",
+			"organizations.create", "organizations.read", "organizations.read_all", "organizations.update", "organizations.delete", "organizations.list", "organizations.manage",
+			"system.settings.read", "system.settings.update", "system.logs.read", "system.backup.manage",
+			"reports.view", "reports.create", "analytics.view",
+			"crm.contacts.create", "crm.contacts.read", "crm.contacts.update", "crm.contacts.delete",
+			"crm.leads.manage", "crm.opportunities.manage",
+			"hrm.employees.create", "hrm.employees.read", "hrm.employees.update", "hrm.employees.delete",
+			"hrm.payroll.manage", "hrm.attendance.manage",
+			"finance.accounts.create", "finance.accounts.read", "finance.accounts.update",
+			"finance.transactions.create", "finance.transactions.read", "finance.reports.view",
+			"inventory.products.create", "inventory.products.read", "inventory.products.update", "inventory.products.delete",
+			"inventory.stock.manage",
+			"projects.create", "projects.read", "projects.update", "projects.delete", "projects.tasks.manage",
 		},
 		"Organization Admin": {
-			"users.create", "users.read", "users.update", "users.delete", "users.list",
+			"users.create", "users.read", "users.update", "users.delete", "users.list", "users.manage",
 			"roles.create", "roles.read", "roles.update", "roles.delete", "roles.list", "roles.assign",
 			"organizations.read", "organizations.update",
 			"system.settings.read", "system.settings.update",
@@ -488,7 +521,7 @@ func (s *Seeder) seedUsers(organizations []models.Organization) ([]models.User, 
 	domains := []string{"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "company.com"}
 
 	var users []models.User
-	rand.Seed(time.Now().UnixNano())
+	// No need to seed random as of Go 1.20+
 
 	// Create 100 users distributed across organizations
 	usersPerOrg := 100 / len(organizations)
@@ -506,21 +539,21 @@ func (s *Seeder) seedUsers(organizations []models.Organization) ([]models.User, 
 			firstName := firstNames[rand.Intn(len(firstNames))]
 			lastName := lastNames[rand.Intn(len(lastNames))]
 			domain := domains[rand.Intn(len(domains))]
-			
+
 			// Create unique email
-			email := fmt.Sprintf("%s.%s%d@%s", 
-				strings.ToLower(firstName), 
-				strings.ToLower(lastName), 
-				userIndex+1, 
+			email := fmt.Sprintf("%s.%s%d@%s",
+				strings.ToLower(firstName),
+				strings.ToLower(lastName),
+				userIndex+1,
 				domain)
 
 			user := models.User{
-				OrganizationID: org.ID,
-				Email:          email,
-				FirstName:      firstName,
-				LastName:       lastName,
-				IsActive:       rand.Float32() > 0.1, // 90% active users
-				IsVerified:     rand.Float32() > 0.2, // 80% verified users
+				OrganizationID:   org.ID,
+				Email:            email,
+				FirstName:        firstName,
+				LastName:         lastName,
+				IsActive:         rand.Float32() > 0.1, // 90% active users
+				IsVerified:       rand.Float32() > 0.2, // 80% verified users
 				TwoFactorEnabled: rand.Float32() > 0.7, // 30% have 2FA enabled
 			}
 
@@ -537,6 +570,19 @@ func (s *Seeder) seedUsers(organizations []models.Organization) ([]models.User, 
 
 			users = append(users, user)
 			userIndex++
+		}
+
+		if org.Domain == "unibaseerp.com" {
+			adminUser := models.User{
+				OrganizationID: org.ID,
+				Email:          "admin@unibaseerp.com",
+				FirstName:      "Admin",
+				LastName:       "User",
+				IsActive:       true,
+				IsVerified:     true,
+			}
+			adminUser.SetPassword("admin123")
+			users = append(users, adminUser)
 		}
 	}
 
@@ -591,13 +637,24 @@ func (s *Seeder) seedUserRoles(users []models.User, roles []models.Role) error {
 
 		// Select a random role based on weights
 		selectedRoleName := weightedRoles[rand.Intn(len(weightedRoles))]
-		
+
 		// Find the actual role object
 		var selectedRole *models.Role
 		for _, role := range orgRoles {
 			if role.Name == selectedRoleName {
 				selectedRole = &role
 				break
+			}
+		}
+
+		if selectedRole.Name == "Super Admin" {
+			for _, user := range users {
+				if user.Email == "admin@unibaseerp.com" {
+					userRoles = append(userRoles, models.UserRole{
+						UserID: user.ID,
+						RoleID: selectedRole.ID,
+					})
+				}
 			}
 		}
 
@@ -680,115 +737,19 @@ func (s *Seeder) printSeedingSummary() {
 	log.Println("=============================")
 	log.Println("All users have the password: 'password123'")
 	log.Println("Example users:")
-	
+
+	// Show super admin credentials
+	log.Println("  • Super Admin:")
+	log.Println("    - Email: admin@test.com")
+	log.Println("    - Password: password123")
+
 	// Show some example users from each organization
 	var sampleUsers []models.User
 	s.db.Preload("Organization").Limit(5).Find(&sampleUsers)
-	
+
 	for _, user := range sampleUsers {
 		log.Printf("  • %s (%s) - %s", user.Email, user.GetFullName(), user.Organization.Name)
 	}
-	
+
 	log.Println("\n✅ Seeding completed successfully!")
-}
-
-// SeedMinimal creates minimal data for testing
-func (s *Seeder) SeedMinimal() error {
-	log.Println("🌱 Starting minimal database seeding...")
-
-	// Create one organization
-	org := models.Organization{
-		Name:   "Test Organization",
-		Domain: "test.com",
-		Settings: models.Settings{
-			Timezone:         "UTC",
-			DateFormat:       "YYYY-MM-DD",
-			Currency:         "USD",
-			Language:         "en",
-			TwoFactorEnabled: false,
-			SessionTimeout:   3600,
-			CustomFields:     map[string]string{"type": "test"},
-		},
-		IsActive: true,
-	}
-
-	if err := s.db.Create(&org).Error; err != nil {
-		return fmt.Errorf("failed to create test organization: %w", err)
-	}
-
-	// Create basic permissions
-	permissions := []models.Permission{
-		{Name: "users.read", Resource: "users", Action: "read", Description: "View users"},
-		{Name: "users.create", Resource: "users", Action: "create", Description: "Create users"},
-		{Name: "roles.read", Resource: "roles", Action: "read", Description: "View roles"},
-	}
-
-	if err := s.db.Create(&permissions).Error; err != nil {
-		return fmt.Errorf("failed to create permissions: %w", err)
-	}
-
-	// Create basic roles
-	adminRole := models.Role{
-		OrganizationID: org.ID,
-		Name:           "Admin",
-		Description:    "Administrator role",
-		IsSystem:       true,
-		IsActive:       true,
-	}
-
-	userRole := models.Role{
-		OrganizationID: org.ID,
-		Name:           "User",
-		Description:    "Standard user role",
-		IsSystem:       false,
-		IsActive:       true,
-	}
-
-	roles := []models.Role{adminRole, userRole}
-	if err := s.db.Create(&roles).Error; err != nil {
-		return fmt.Errorf("failed to create roles: %w", err)
-	}
-
-	// Create test users
-	adminUser := models.User{
-		OrganizationID: org.ID,
-		Email:          "admin@test.com",
-		FirstName:      "Admin",
-		LastName:       "User",
-		IsActive:       true,
-		IsVerified:     true,
-	}
-	adminUser.SetPassword("admin123")
-
-	testUser := models.User{
-		OrganizationID: org.ID,
-		Email:          "user@test.com",
-		FirstName:      "Test",
-		LastName:       "User",
-		IsActive:       true,
-		IsVerified:     true,
-	}
-	testUser.SetPassword("user123")
-
-	users := []models.User{adminUser, testUser}
-	if err := s.db.Create(&users).Error; err != nil {
-		return fmt.Errorf("failed to create users: %w", err)
-	}
-
-	// Assign roles to users
-	userRoles := []models.UserRole{
-		{UserID: adminUser.ID, RoleID: adminRole.ID},
-		{UserID: testUser.ID, RoleID: userRole.ID},
-	}
-
-	if err := s.db.Create(&userRoles).Error; err != nil {
-		return fmt.Errorf("failed to assign user roles: %w", err)
-	}
-
-	log.Println("✅ Minimal seeding completed!")
-	log.Println("Test credentials:")
-	log.Println("  Admin: admin@test.com / admin123")
-	log.Println("  User:  user@test.com / user123")
-
-	return nil
 }
