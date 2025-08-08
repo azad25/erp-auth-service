@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Seeder struct {
@@ -59,6 +60,10 @@ func (s *Seeder) SeedAll() error {
 
 	if err := s.seedUserRoles(users, roles); err != nil {
 		return fmt.Errorf("failed to seed user roles: %w", err)
+	}
+
+	if err := s.seedUserActivities(users); err != nil {
+		return fmt.Errorf("failed to seed user activities: %w", err)
 	}
 
 	log.Println("✅ Database seeding completed successfully!")
@@ -226,12 +231,30 @@ func (s *Seeder) seedOrganizations() ([]models.Organization, error) {
 		},
 	}
 
-	if err := s.db.Create(&organizations).Error; err != nil {
+	// Build list of domains for lookup
+	domains := make([]string, 0, len(organizations))
+	for _, org := range organizations {
+		domains = append(domains, org.Domain)
+	}
+
+	// Idempotent insert: ON CONFLICT(domain) DO NOTHING
+	if err := s.db.
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "domain"}},
+			DoNothing: true,
+		}).
+		Create(&organizations).Error; err != nil {
 		return nil, err
 	}
 
-	log.Printf("✅ Created %d organizations", len(organizations))
-	return organizations, nil
+	// Reload organizations (existing or newly inserted) to get IDs
+	var out []models.Organization
+	if err := s.db.Where("domain IN ?", domains).Find(&out).Error; err != nil {
+		return nil, err
+	}
+
+	log.Printf("✅ Ensured %d organizations (inserted or existing)", len(out))
+	return out, nil
 }
 
 func (s *Seeder) seedPermissions() ([]models.Permission, error) {
@@ -314,12 +337,28 @@ func (s *Seeder) seedPermissions() ([]models.Permission, error) {
 		{Name: "analytics.view", Resource: "analytics", Action: "view", Description: "View analytics dashboards"},
 	}
 
-	if err := s.db.Create(&permissions).Error; err != nil {
+	// Idempotent insert on unique(name)
+	if err := s.db.
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "name"}},
+			DoNothing: true,
+		}).
+		Create(&permissions).Error; err != nil {
 		return nil, err
 	}
 
-	log.Printf("✅ Created %d permissions", len(permissions))
-	return permissions, nil
+	// Reload full permission records by name to ensure IDs are populated
+	var out []models.Permission
+	names := make([]string, 0, len(permissions))
+	for _, p := range permissions {
+		names = append(names, p.Name)
+	}
+	if err := s.db.Where("name IN ?", names).Find(&out).Error; err != nil {
+		return nil, err
+	}
+
+	log.Printf("✅ Ensured %d permissions (inserted or existing)", len(out))
+	return out, nil
 }
 
 func (s *Seeder) seedRoles(organizations []models.Organization) ([]models.Role, error) {
@@ -345,25 +384,24 @@ func (s *Seeder) seedRoles(organizations []models.Organization) ([]models.Role, 
 		{"Viewer", "Read-only access to most resources", false},
 	}
 
-	// Create roles for each organization
+	// Ensure roles exist for each organization without creating duplicates
 	for _, org := range organizations {
 		for _, template := range roleTemplates {
-			role := models.Role{
-				OrganizationID: org.ID,
-				Name:           template.Name,
-				Description:    template.Description,
-				IsSystem:       template.IsSystem,
-				IsActive:       true,
+			var role models.Role
+			if err := s.db.
+				Attrs(models.Role{
+					Description: template.Description,
+					IsSystem:    template.IsSystem,
+					IsActive:    true,
+				}).
+				FirstOrCreate(&role, models.Role{OrganizationID: org.ID, Name: template.Name}).Error; err != nil {
+				return nil, err
 			}
 			allRoles = append(allRoles, role)
 		}
 	}
 
-	if err := s.db.Create(&allRoles).Error; err != nil {
-		return nil, err
-	}
-
-	log.Printf("✅ Created %d roles", len(allRoles))
+	log.Printf("✅ Ensured %d roles (created or existing)", len(allRoles))
 	return allRoles, nil
 }
 
@@ -480,11 +518,16 @@ func (s *Seeder) seedRolePermissions(roles []models.Role, permissions []models.P
 		}
 	}
 
-	if err := s.db.Create(&rolePermissions).Error; err != nil {
+	if err := s.db.
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "role_id"}, {Name: "permission_id"}},
+			DoNothing: true,
+		}).
+		Create(&rolePermissions).Error; err != nil {
 		return err
 	}
 
-	log.Printf("✅ Created %d role permissions", len(rolePermissions))
+	log.Printf("✅ Ensured %d role permissions (created or existing)", len(rolePermissions))
 	return nil
 }
 
@@ -647,22 +690,30 @@ func (s *Seeder) seedUserRoles(users []models.User, roles []models.Role) error {
 			}
 		}
 
-		if selectedRole.Name == "Super Admin" {
-			for _, user := range users {
-				if user.Email == "admin@unibaseerp.com" {
+		if selectedRole != nil {
+			// Special handling for admin user - always assign Super Admin role
+			if user.Email == "admin@unibaseerp.com" {
+				// Find Super Admin role for this organization
+				var superAdminRole *models.Role
+				for _, role := range orgRoles {
+					if role.Name == "Super Admin" {
+						superAdminRole = &role
+						break
+					}
+				}
+				if superAdminRole != nil {
 					userRoles = append(userRoles, models.UserRole{
 						UserID: user.ID,
-						RoleID: selectedRole.ID,
+						RoleID: superAdminRole.ID,
 					})
 				}
+			} else {
+				// For regular users, assign the selected role
+				userRoles = append(userRoles, models.UserRole{
+					UserID: user.ID,
+					RoleID: selectedRole.ID,
+				})
 			}
-		}
-
-		if selectedRole != nil {
-			userRoles = append(userRoles, models.UserRole{
-				UserID: user.ID,
-				RoleID: selectedRole.ID,
-			})
 		}
 
 		// Some users might have multiple roles (10% chance)
@@ -681,11 +732,16 @@ func (s *Seeder) seedUserRoles(users []models.User, roles []models.Role) error {
 		}
 	}
 
-	if err := s.db.Create(&userRoles).Error; err != nil {
+	if err := s.db.
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "user_id"}, {Name: "role_id"}},
+			DoNothing: true,
+		}).
+		Create(&userRoles).Error; err != nil {
 		return err
 	}
 
-	log.Printf("✅ Created %d user role assignments", len(userRoles))
+	log.Printf("✅ Ensured %d user role assignments (created or existing)", len(userRoles))
 	return nil
 }
 
@@ -733,6 +789,11 @@ func (s *Seeder) printSeedingSummary() {
 	s.db.Model(&models.RolePermission{}).Count(&rolePermissionCount)
 	log.Printf("Role Permission Assignments: %d", rolePermissionCount)
 
+	// Count user activities
+	var activityCount int64
+	s.db.Model(&models.UserActivity{}).Count(&activityCount)
+	log.Printf("User Activities: %d", activityCount)
+
 	log.Println("\n🔐 Default Login Credentials:")
 	log.Println("=============================")
 	log.Println("All users have the password: 'password123'")
@@ -740,8 +801,8 @@ func (s *Seeder) printSeedingSummary() {
 
 	// Show super admin credentials
 	log.Println("  • Super Admin:")
-	log.Println("    - Email: admin@test.com")
-	log.Println("    - Password: password123")
+	log.Println("    - Email: admin@unibaseerp.com")
+	log.Println("    - Password: admin123")
 
 	// Show some example users from each organization
 	var sampleUsers []models.User
@@ -752,4 +813,138 @@ func (s *Seeder) printSeedingSummary() {
 	}
 
 	log.Println("\n✅ Seeding completed successfully!")
+}
+func (s *Seeder) seedUserActivities(users []models.User) error {
+	log.Println("📊 Seeding user activities...")
+
+	// Check if activities already exist
+	var activityCount int64
+	s.db.Model(&models.UserActivity{}).Count(&activityCount)
+	if activityCount > 0 {
+		log.Printf("⚠️  Database already contains %d activities. Skipping activity seeding.", activityCount)
+		return nil
+	}
+
+	var activities []models.UserActivity
+
+	// Activity types and resources
+	activityTypes := []struct {
+		Action   string
+		Resource string
+		Details  string
+	}{
+		{models.ActionLogin, models.ResourceAuth, `{"success": true, "method": "email_password"}`},
+		{models.ActionLogout, models.ResourceAuth, `{"session_duration": 3600}`},
+		{models.ActionLoginFailed, models.ResourceAuth, `{"reason": "invalid_password", "attempts": 1}`},
+		{models.ActionPasswordChanged, models.ResourceProfile, `{"strength": "strong"}`},
+		{models.ActionProfileUpdated, models.ResourceProfile, `{"fields": ["first_name", "last_name"]}`},
+		{models.ActionUserCreated, models.ResourceUser, `{"role": "employee"}`},
+		{models.ActionUserUpdated, models.ResourceUser, `{"fields": ["email", "is_active"]}`},
+		{models.ActionUserActivated, models.ResourceUser, `{"previous_status": "inactive"}`},
+		{models.ActionUserDeactivated, models.ResourceUser, `{"reason": "policy_violation"}`},
+		{models.ActionRoleAssigned, models.ResourceRole, `{"role_name": "manager"}`},
+		{models.ActionRoleRemoved, models.ResourceRole, `{"role_name": "employee"}`},
+		{models.ActionOrganizationUpdated, models.ResourceOrganization, `{"fields": ["settings"]}`},
+	}
+
+	// IP addresses for variety
+	ipAddresses := []string{
+		"192.168.1.100", "10.0.0.50", "172.16.0.25", "203.0.113.10", "198.51.100.5",
+		"192.168.0.150", "10.1.1.75", "172.20.0.30", "203.0.113.20", "198.51.100.15",
+	}
+
+	// User agents for variety
+	userAgents := []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (Android 11; Mobile; rv:68.0) Gecko/68.0 Firefox/88.0",
+	}
+
+	// Generate activities for each user
+	for _, user := range users {
+		// Generate 5-20 activities per user
+		numActivities := rand.Intn(16) + 5
+
+		for i := 0; i < numActivities; i++ {
+			// Select random activity type
+			activityType := activityTypes[rand.Intn(len(activityTypes))]
+			
+			// Create activity with random timestamp in the last 30 days
+			createdAt := time.Now().AddDate(0, 0, -rand.Intn(30)).Add(
+				-time.Duration(rand.Intn(24)) * time.Hour,
+			).Add(
+				-time.Duration(rand.Intn(60)) * time.Minute,
+			)
+
+			activity := models.UserActivity{
+				UserID:         user.ID,
+				OrganizationID: user.OrganizationID,
+				Action:         activityType.Action,
+				Resource:       activityType.Resource,
+				Details:        activityType.Details,
+				IPAddress:      ipAddresses[rand.Intn(len(ipAddresses))],
+				UserAgent:      userAgents[rand.Intn(len(userAgents))],
+				CreatedAt:      createdAt,
+				UpdatedAt:      createdAt,
+			}
+
+			activities = append(activities, activity)
+		}
+
+		// Add some recent login activities for active users
+		if user.IsActive && user.LastLoginAt != nil {
+			// Add a recent successful login
+			recentLogin := models.UserActivity{
+				UserID:         user.ID,
+				OrganizationID: user.OrganizationID,
+				Action:         models.ActionLogin,
+				Resource:       models.ResourceAuth,
+				Details:        `{"success": true, "method": "email_password", "remember_me": false}`,
+				IPAddress:      ipAddresses[rand.Intn(len(ipAddresses))],
+				UserAgent:      userAgents[rand.Intn(len(userAgents))],
+				CreatedAt:      *user.LastLoginAt,
+				UpdatedAt:      *user.LastLoginAt,
+			}
+			activities = append(activities, recentLogin)
+		}
+	}
+
+	// Add some failed login attempts (security events)
+	for i := 0; i < 20; i++ {
+		// Random user for failed login attempt
+		user := users[rand.Intn(len(users))]
+		
+		failedLogin := models.UserActivity{
+			UserID:         user.ID, // Use actual user ID instead of nil
+			OrganizationID: user.OrganizationID,
+			Action:         models.ActionLoginFailed,
+			Resource:       models.ResourceAuth,
+			Details:        fmt.Sprintf(`{"email": "%s", "reason": "invalid_password", "attempts": %d}`, user.Email, rand.Intn(3)+1),
+			IPAddress:      ipAddresses[rand.Intn(len(ipAddresses))],
+			UserAgent:      userAgents[rand.Intn(len(userAgents))],
+			CreatedAt:      time.Now().AddDate(0, 0, -rand.Intn(7)), // Within last week
+			UpdatedAt:      time.Now().AddDate(0, 0, -rand.Intn(7)),
+		}
+		activities = append(activities, failedLogin)
+	}
+
+	// Batch insert activities
+	batchSize := 100
+	for i := 0; i < len(activities); i += batchSize {
+		end := i + batchSize
+		if end > len(activities) {
+			end = len(activities)
+		}
+
+		if err := s.db.Create(activities[i:end]).Error; err != nil {
+			return fmt.Errorf("failed to create activity batch: %w", err)
+		}
+	}
+
+	log.Printf("✅ Created %d user activities", len(activities))
+	return nil
 }

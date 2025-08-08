@@ -14,6 +14,7 @@ import (
 	"erp-auth-service/internal/cache"
 	"erp-auth-service/internal/config"
 	"erp-auth-service/internal/domain/entities"
+	"erp-auth-service/internal/elasticsearch"
 	internalErrors "erp-auth-service/internal/errors"
 	"erp-auth-service/internal/events"
 	"erp-auth-service/internal/grpc/interceptors"
@@ -31,6 +32,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/gorm"
 )
@@ -38,23 +40,24 @@ import (
 // EnhancedAuthGRPCServer represents the enhanced gRPC server with interceptor chain
 type EnhancedAuthGRPCServer struct {
 	pb.UnimplementedAuthServiceServer
-	
+
 	// Dependencies
 	db          *gorm.DB
 	redisClient *redis.Client
 	config      *config.Config
 	logger      *zap.Logger
-	
+
 	// Business services
 	authService       *services.AuthService
 	tokenService      *services.TokenService
 	permissionService *services.PermissionService
+	activityService   ActivityServiceInterface
 	cacheManager      cache.CacheManager
-	
+
 	// Server components
-	grpcServer    *grpc.Server
-	listener      net.Listener
-	
+	grpcServer *grpc.Server
+	listener   net.Listener
+
 	// Interceptors and middleware
 	rateLimiter           *interceptors.RateLimiter
 	circuitBreakerManager *interceptors.CircuitBreakerManager
@@ -62,16 +65,26 @@ type EnhancedAuthGRPCServer struct {
 	loggingInterceptor    *interceptors.LoggingInterceptor
 	authInterceptor       *interceptors.AuthInterceptor
 	recoveryInterceptor   *interceptors.RecoveryInterceptor
-	
+
 	// Error handling
 	errorHandler *internalErrors.ErrorHandler
-	
+
 	// Metrics registry
 	metricsRegistry *prometheus.Registry
-	
+
 	// Shutdown coordination
 	shutdownCh chan struct{}
 	wg         sync.WaitGroup
+}
+
+// ActivityServiceInterface abstracts activity logging/retrieval backend (PostgreSQL or Elasticsearch)
+type ActivityServiceInterface interface {
+	LogActivity(ctx context.Context, userID, organizationID uuid.UUID, action, resource string, details map[string]interface{}, ipAddress, userAgent string) error
+	GetUserActivities(ctx context.Context, userID *uuid.UUID, organizationID *uuid.UUID, limit, offset int) ([]*models.UserActivity, int64, error)
+	GetSecurityStats(ctx context.Context, organizationID uuid.UUID) (map[string]int64, error)
+	LogLogin(ctx context.Context, userID, organizationID uuid.UUID, ipAddress, userAgent string) error
+	LogLoginFailed(ctx context.Context, email, ipAddress, userAgent string, organizationID uuid.UUID) error
+	LogLogout(ctx context.Context, userID, organizationID uuid.UUID, ipAddress, userAgent string) error
 }
 
 // NewAuthGRPCServer creates a new gRPC server with properly initialized dependencies
@@ -82,10 +95,10 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 		// Fallback to development logger if production fails
 		logger, _ = zap.NewDevelopment()
 	}
-	
+
 	// Initialize repository factory
 	repoFactory := repositories.NewRepositoryFactory(db, db) // Using same DB for read/write for now
-	
+
 	// Initialize cache manager with proper configuration
 	cacheConfig := cache.CacheConfig{
 		BigCacheConfig: cache.BigCacheConfig{
@@ -121,7 +134,7 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 		WarmupBatchSize:   100,
 		InvalidationDelay: time.Second,
 	}
-	
+
 	var cacheManager cache.CacheManager
 	cacheManagerImpl, err := cache.NewCacheManager(cacheConfig, logger)
 	if err != nil {
@@ -131,7 +144,7 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 	} else {
 		cacheManager = cacheManagerImpl
 	}
-	
+
 	// Initialize event publisher
 	eventPublisher := &KafkaEventPublisher{
 		producer: events.NewProducer(events.ProducerConfig{
@@ -140,7 +153,7 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 		}),
 		logger: logger,
 	}
-	
+
 	// Initialize services with proper dependencies
 	tokenService := services.NewTokenService(
 		config,
@@ -149,7 +162,7 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 		cacheManager,
 		redisClient,
 	)
-	
+
 	permissionService := services.NewPermissionService(
 		repoFactory.PermissionRepository(),
 		repoFactory.RoleRepository(),
@@ -164,7 +177,33 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 			EvaluationTimeout:     30 * time.Second,
 		},
 	)
-	
+
+	// Initialize activity service (Elasticsearch preferred if enabled)
+	var activityService ActivityServiceInterface
+	if config.Elasticsearch.Enabled {
+		esClient, err := elasticsearch.NewClient(elasticsearch.Config{
+			Addresses: config.Elasticsearch.Addresses,
+			Username:  config.Elasticsearch.Username,
+			Password:  config.Elasticsearch.Password,
+			APIKey:    config.Elasticsearch.APIKey,
+		}, logger)
+		if err != nil {
+			logger.Warn("Falling back to PostgreSQL activity service due to Elasticsearch init failure", zap.Error(err))
+			activityService = services.NewActivityService(
+				repositories.NewUserActivityRepository(db),
+				logger,
+			)
+		} else {
+			// Attach Redis client for real-time WebSocket publishing
+			activityService = services.NewElasticsearchActivityService(esClient, logger).WithRedis(redisClient)
+		}
+	} else {
+		activityService = services.NewActivityService(
+			repositories.NewUserActivityRepository(db),
+			logger,
+		)
+	}
+
 	authService := services.NewAuthService(
 		config,
 		logger,
@@ -175,24 +214,25 @@ func NewAuthGRPCServer(db *gorm.DB, redisClient *redis.Client, config *config.Co
 		eventPublisher,
 		cacheManager,
 	)
-	
-	return NewEnhancedAuthGRPCServer(db, redisClient, config, logger, authService, tokenService, permissionService, cacheManager)
+
+	return NewEnhancedAuthGRPCServer(db, redisClient, config, logger, authService, tokenService, permissionService, activityService, cacheManager)
 }
 
 // NewEnhancedAuthGRPCServer creates a new enhanced gRPC server
 func NewEnhancedAuthGRPCServer(
-	db *gorm.DB, 
-	redisClient *redis.Client, 
-	config *config.Config, 
+	db *gorm.DB,
+	redisClient *redis.Client,
+	config *config.Config,
 	logger *zap.Logger,
 	authService *services.AuthService,
 	tokenService *services.TokenService,
 	permissionService *services.PermissionService,
+	activityService ActivityServiceInterface,
 	cacheManager cache.CacheManager,
 ) *EnhancedAuthGRPCServer {
 	// Create metrics registry
 	metricsRegistry := prometheus.NewRegistry()
-	
+
 	// Initialize interceptors
 	rateLimiterConfig := interceptors.RateLimiterConfig{
 		RequestsPerSecond: 1000, // 1000 RPS per client
@@ -200,7 +240,7 @@ func NewEnhancedAuthGRPCServer(
 		WindowSize:        time.Minute,
 		RedisKeyPrefix:    "ratelimit",
 	}
-	
+
 	server := &EnhancedAuthGRPCServer{
 		db:              db,
 		redisClient:     redisClient,
@@ -208,13 +248,14 @@ func NewEnhancedAuthGRPCServer(
 		logger:          logger,
 		metricsRegistry: metricsRegistry,
 		shutdownCh:      make(chan struct{}),
-		
+
 		// Business services
 		authService:       authService,
 		tokenService:      tokenService,
 		permissionService: permissionService,
+		activityService:   activityService,
 		cacheManager:      cacheManager,
-		
+
 		// Initialize interceptors
 		rateLimiter:           interceptors.NewRateLimiter(redisClient, rateLimiterConfig, logger),
 		circuitBreakerManager: interceptors.NewCircuitBreakerManager(logger),
@@ -223,13 +264,13 @@ func NewEnhancedAuthGRPCServer(
 		authInterceptor:       interceptors.NewAuthInterceptor(config.JWT.Secret, "internal-service-key", logger),
 		recoveryInterceptor:   interceptors.NewRecoveryInterceptor(logger),
 	}
-	
+
 	// Initialize comprehensive error handler
 	server.errorHandler = internalErrors.NewErrorHandler(logger, internalErrors.GetDefaultErrorHandlerConfig())
-	
+
 	// Register circuit breakers for dependencies
 	server.setupCircuitBreakers()
-	
+
 	return server
 }
 
@@ -237,13 +278,13 @@ func NewEnhancedAuthGRPCServer(
 func (s *EnhancedAuthGRPCServer) setupCircuitBreakers() {
 	// Database circuit breaker
 	s.circuitBreakerManager.RegisterBreaker("database", interceptors.GetDefaultDatabaseConfig())
-	
+
 	// Redis circuit breaker
 	s.circuitBreakerManager.RegisterBreaker("redis", interceptors.GetDefaultRedisConfig())
-	
+
 	// Kafka circuit breaker (if needed)
 	s.circuitBreakerManager.RegisterBreaker("kafka", interceptors.GetDefaultKafkaConfig())
-	
+
 	// gRPC handler circuit breaker
 	s.circuitBreakerManager.RegisterBreaker("grpc-handler", interceptors.CircuitBreakerConfig{
 		MaxRequests: 10,
@@ -264,7 +305,7 @@ func (s *EnhancedAuthGRPCServer) Start() error {
 		return fmt.Errorf("failed to listen on port %s: %w", s.config.GRPC.Port, err)
 	}
 	s.listener = lis
-	
+
 	// Create gRPC server with enhanced configuration
 	s.grpcServer = grpc.NewServer(
 		// Connection settings
@@ -279,20 +320,20 @@ func (s *EnhancedAuthGRPCServer) Start() error {
 			MinTime:             time.Duration(s.config.GRPC.KeepaliveEnforcementMinTime) * time.Second,
 			PermitWithoutStream: s.config.GRPC.KeepaliveEnforcementPermitWithoutStream,
 		}),
-		
+
 		// Message size limits
 		grpc.MaxRecvMsgSize(s.config.GRPC.MaxRecvMsgSize),
 		grpc.MaxSendMsgSize(s.config.GRPC.MaxSendMsgSize),
 		grpc.MaxConcurrentStreams(uint32(s.config.GRPC.MaxConcurrentStreams)),
-		
+
 		// Interceptor chain - order matters!
 		grpc.ChainUnaryInterceptor(
-			s.recoveryInterceptor.UnaryServerInterceptor(),     // First: catch panics
-			s.loggingInterceptor.UnaryServerInterceptor(),      // Second: log requests
-			s.metricsInterceptor.UnaryServerInterceptor(),      // Third: collect metrics
-			s.rateLimiter.UnaryServerInterceptor(),             // Fourth: rate limiting
-			s.authInterceptor.UnaryServerInterceptor(),         // Fifth: authentication
-			s.circuitBreakerManager.UnaryServerInterceptor(),   // Sixth: circuit breaker
+			s.recoveryInterceptor.UnaryServerInterceptor(),   // First: catch panics
+			s.loggingInterceptor.UnaryServerInterceptor(),    // Second: log requests
+			s.metricsInterceptor.UnaryServerInterceptor(),    // Third: collect metrics
+			s.rateLimiter.UnaryServerInterceptor(),           // Fourth: rate limiting
+			s.authInterceptor.UnaryServerInterceptor(),       // Fifth: authentication
+			s.circuitBreakerManager.UnaryServerInterceptor(), // Sixth: circuit breaker
 		),
 		grpc.ChainStreamInterceptor(
 			s.recoveryInterceptor.StreamServerInterceptor(),
@@ -303,10 +344,10 @@ func (s *EnhancedAuthGRPCServer) Start() error {
 			s.circuitBreakerManager.StreamServerInterceptor(),
 		),
 	)
-	
+
 	// Register service
 	pb.RegisterAuthServiceServer(s.grpcServer, s)
-	
+
 	// Start server in goroutine
 	s.wg.Add(1)
 	go func() {
@@ -316,15 +357,15 @@ func (s *EnhancedAuthGRPCServer) Start() error {
 			zap.Int("max_concurrent_streams", s.config.GRPC.MaxConcurrentStreams),
 			zap.Int("max_recv_msg_size", s.config.GRPC.MaxRecvMsgSize),
 			zap.Int("max_send_msg_size", s.config.GRPC.MaxSendMsgSize))
-		
+
 		if err := s.grpcServer.Serve(lis); err != nil {
 			s.logger.Error("gRPC server error", zap.Error(err))
 		}
 	}()
-	
+
 	// Setup graceful shutdown
 	s.setupGracefulShutdown()
-	
+
 	return nil
 }
 
@@ -332,7 +373,7 @@ func (s *EnhancedAuthGRPCServer) Start() error {
 func (s *EnhancedAuthGRPCServer) setupGracefulShutdown() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	go func() {
 		sig := <-sigCh
 		s.logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
@@ -343,21 +384,21 @@ func (s *EnhancedAuthGRPCServer) setupGracefulShutdown() {
 // Shutdown gracefully shuts down the server
 func (s *EnhancedAuthGRPCServer) Shutdown() {
 	s.logger.Info("Starting graceful shutdown...")
-	
+
 	// Close shutdown channel to signal shutdown
 	close(s.shutdownCh)
-	
+
 	// Create shutdown context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	
+
 	// Graceful stop with timeout
 	done := make(chan struct{})
 	go func() {
 		s.grpcServer.GracefulStop()
 		close(done)
 	}()
-	
+
 	select {
 	case <-done:
 		s.logger.Info("gRPC server stopped gracefully")
@@ -365,7 +406,7 @@ func (s *EnhancedAuthGRPCServer) Shutdown() {
 		s.logger.Warn("Graceful shutdown timeout, forcing stop")
 		s.grpcServer.Stop()
 	}
-	
+
 	// Wait for all goroutines to finish
 	s.wg.Wait()
 	s.logger.Info("Enhanced gRPC server shutdown complete")
@@ -397,9 +438,9 @@ func (s *EnhancedAuthGRPCServer) Authenticate(ctx context.Context, req *pb.Authe
 		Email:    req.Email,
 		Password: req.Password,
 		SecurityContext: &services.SecurityContext{
-			IPAddress:   req.SecurityContext.GetIpAddress(),
-			UserAgent:   req.SecurityContext.GetUserAgent(),
-			SessionID:   req.SecurityContext.GetSessionId(),
+			IPAddress: req.SecurityContext.GetIpAddress(),
+			UserAgent: req.SecurityContext.GetUserAgent(),
+			SessionID: req.SecurityContext.GetSessionId(),
 		},
 		RememberMe: req.RememberMe,
 	}
@@ -408,6 +449,16 @@ func (s *EnhancedAuthGRPCServer) Authenticate(ctx context.Context, req *pb.Authe
 	authResp, err := s.authService.Authenticate(ctx, authReq)
 	if err != nil {
 		s.logger.Error("Authentication failed", zap.Error(err))
+
+		// Log failed login attempt
+		if s.activityService != nil {
+			// For failed authentication, we don't have organization ID, so we'll use a default or skip
+			s.activityService.LogLoginFailed(ctx, req.Email,
+				req.SecurityContext.GetIpAddress(),
+				req.SecurityContext.GetUserAgent(),
+				uuid.Nil) // We'll need to handle this better
+		}
+
 		return &pb.AuthenticateResponse{
 			Success: false,
 			Error:   "authentication failed",
@@ -421,6 +472,14 @@ func (s *EnhancedAuthGRPCServer) Authenticate(ctx context.Context, req *pb.Authe
 	}
 
 	if authResp.Success && authResp.User != nil {
+		// Log successful login
+		if s.activityService != nil {
+			s.activityService.LogLogin(ctx,
+				authResp.User.ID,
+				authResp.User.OrganizationID,
+				req.SecurityContext.GetIpAddress(),
+				req.SecurityContext.GetUserAgent())
+		}
 		// Convert user
 		response.User = &pb.User{
 			Id:             authResp.User.ID.String(),
@@ -441,10 +500,10 @@ func (s *EnhancedAuthGRPCServer) Authenticate(ctx context.Context, req *pb.Authe
 		// Convert tokens if available
 		if authResp.TokenPair != nil {
 			response.Tokens = &pb.TokenPair{
-				AccessToken:  authResp.TokenPair.AccessToken,
-				RefreshToken: authResp.TokenPair.RefreshToken,
-				TokenType:    authResp.TokenPair.TokenType,
-				ExpiresAt:    timestamppb.New(authResp.TokenPair.ExpiresAt),
+				AccessToken:      authResp.TokenPair.AccessToken,
+				RefreshToken:     authResp.TokenPair.RefreshToken,
+				TokenType:        authResp.TokenPair.TokenType,
+				ExpiresAt:        timestamppb.New(authResp.TokenPair.ExpiresAt),
 				RefreshExpiresAt: timestamppb.New(authResp.TokenPair.RefreshExpiresAt),
 			}
 		}
@@ -463,7 +522,7 @@ func (s *EnhancedAuthGRPCServer) ValidateToken(ctx context.Context, req *pb.Vali
 			s.metricsInterceptor.RecordTokenValidationDuration(duration)
 		}
 		if duration > 10*time.Millisecond {
-			s.logger.Warn("Token validation exceeded 10ms target", 
+			s.logger.Warn("Token validation exceeded 10ms target",
 				zap.Duration("duration", duration),
 				zap.String("token_prefix", req.Token[:min(len(req.Token), 20)]))
 		}
@@ -506,13 +565,13 @@ func (s *EnhancedAuthGRPCServer) RefreshToken(ctx context.Context, req *pb.Refre
 
 	// Use token service for atomic refresh operation
 	tokenService := s.getTokenService()
-	
+
 	// Create security context from request metadata if available
 	securityCtx := &services.SecurityContext{
 		IPAddress: "unknown", // Extract from gRPC metadata if needed
 		UserAgent: "grpc-client",
 	}
-	
+
 	tokenPair, err := tokenService.RefreshToken(ctx, req.RefreshToken, securityCtx)
 	if err != nil {
 		s.logger.Debug("Token refresh failed", zap.Error(err))
@@ -584,45 +643,45 @@ func (s *EnhancedAuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserReq
 
 	// Fetch directly from database with minimal query
 	var user models.User
-	
+
 	// Add debug logging for the exact query
-	s.logger.Info("Executing user lookup query", 
+	s.logger.Info("Executing user lookup query",
 		zap.String("user_id", userID.String()),
 		zap.String("query", "SELECT * FROM users WHERE id = ?"))
-	
+
 	err = s.db.Where("id = ?", userID).First(&user).Error
-	
+
 	if err != nil {
-		s.logger.Error("Database user lookup failed", 
-			zap.Error(err), 
+		s.logger.Error("Database user lookup failed",
+			zap.Error(err),
 			zap.String("user_id", userID.String()),
 			zap.String("error_message", err.Error()),
 			zap.String("error_type", fmt.Sprintf("%T", err)))
-		
+
 		// Try alternative query methods to debug
 		var userByString models.User
 		stringErr := s.db.Where("id::text = ?", userID.String()).First(&userByString).Error
-		s.logger.Debug("Alternative string query result", 
+		s.logger.Debug("Alternative string query result",
 			zap.Error(stringErr),
 			zap.Bool("found_by_string", stringErr == nil))
-		
+
 		// Try to find any user with similar ID to debug
 		var similarUsers []models.User
 		s.db.Where("id::text LIKE ?", userID.String()[:8]+"%").Limit(5).Find(&similarUsers)
 		s.logger.Debug("Similar users found", zap.Int("count", len(similarUsers)))
-		
+
 		// Try to get the first user to test basic connectivity
 		var firstUser models.User
 		firstErr := s.db.First(&firstUser).Error
-		s.logger.Debug("First user query test", 
+		s.logger.Debug("First user query test",
 			zap.Error(firstErr),
 			zap.Bool("can_query_users", firstErr == nil))
-		
+
 		return &pb.GetUserResponse{
 			Error: fmt.Sprintf("user not found: %s", userID.String()),
 		}, nil
 	}
-	
+
 	// Load organization separately if needed
 	var org models.Organization
 	if user.OrganizationID != uuid.Nil {
@@ -630,7 +689,7 @@ func (s *EnhancedAuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserReq
 		user.Organization = org
 	}
 
-	s.logger.Info("User found in database", 
+	s.logger.Info("User found in database",
 		zap.String("user_id", userID.String()),
 		zap.String("email", user.Email),
 		zap.String("name", user.FirstName+" "+user.LastName))
@@ -638,7 +697,7 @@ func (s *EnhancedAuthGRPCServer) GetUser(ctx context.Context, req *pb.GetUserReq
 	// Convert to protobuf with all relationships
 	pbUser := s.convertUserToProto(&user)
 
-	s.logger.Info("User converted to protobuf successfully", 
+	s.logger.Info("User converted to protobuf successfully",
 		zap.String("user_id", userID.String()),
 		zap.Bool("pb_user_nil", pbUser == nil))
 
@@ -669,7 +728,7 @@ func (s *EnhancedAuthGRPCServer) CheckPermission(ctx context.Context, req *pb.Ch
 	permissionService := s.getPermissionService()
 	hasPermission, err := permissionService.CheckUserPermissionWithScope(ctx, userID, req.Resource, req.Action, "")
 	if err != nil {
-		s.logger.Error("Permission check failed", zap.Error(err), 
+		s.logger.Error("Permission check failed", zap.Error(err),
 			zap.String("user_id", userID.String()),
 			zap.String("resource", req.Resource),
 			zap.String("action", req.Action))
@@ -717,11 +776,11 @@ func (s *EnhancedAuthGRPCServer) CreateUser(ctx context.Context, req *pb.CreateU
 
 	// Create registration request
 	regReq := &services.RegistrationRequest{
-		Email:            req.Email,
-		Password:         req.Password,
-		FirstName:        req.FirstName,
-		LastName:         req.LastName,
-		SecurityContext:  securityCtx,
+		Email:           req.Email,
+		Password:        req.Password,
+		FirstName:       req.FirstName,
+		LastName:        req.LastName,
+		SecurityContext: securityCtx,
 	}
 
 	// For existing organization, we need a different method
@@ -769,7 +828,7 @@ func (s *EnhancedAuthGRPCServer) UpdateUser(ctx context.Context, req *pb.UpdateU
 	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
 		return nil, s.db.Where("id = ?", userID).First(&user).Error
 	})
-	
+
 	if err != nil {
 		return &pb.UpdateUserResponse{
 			Success: false,
@@ -811,7 +870,7 @@ func (s *EnhancedAuthGRPCServer) UpdateUser(ctx context.Context, req *pb.UpdateU
 					if err != nil {
 						continue // Skip invalid role IDs
 					}
-					
+
 					userRole := models.UserRole{
 						UserID: userID,
 						RoleID: roleID,
@@ -998,10 +1057,10 @@ func (s *EnhancedAuthGRPCServer) GetOrganization(ctx context.Context, req *pb.Ge
 		}
 	}
 
-	// Get from database
+	// Get from database with users preloaded
 	var org models.Organization
 	_, err = s.circuitBreakerManager.Execute("database", func() (interface{}, error) {
-		return nil, s.db.Where("id = ?", orgID).First(&org).Error
+		return nil, s.db.Preload("Users").Where("id = ?", orgID).First(&org).Error
 	})
 
 	if err != nil {
@@ -1178,7 +1237,7 @@ func (s *EnhancedAuthGRPCServer) BulkCreateUsers(ctx context.Context, req *pb.Bu
 
 		batch := req.Users[i:end]
 		batchResults := s.processBulkUserCreation(ctx, orgID, batch, i)
-		
+
 		for j, result := range batchResults {
 			results[i+j] = result
 			if result.Success {
@@ -1220,7 +1279,7 @@ func (s *EnhancedAuthGRPCServer) BulkUpdateUsers(ctx context.Context, req *pb.Bu
 
 		batch := req.Users[i:end]
 		batchResults := s.processBulkUserUpdate(ctx, batch, i)
-		
+
 		for j, result := range batchResults {
 			results[i+j] = result
 			if result.Success {
@@ -1262,7 +1321,7 @@ func (s *EnhancedAuthGRPCServer) BulkCheckPermissions(ctx context.Context, req *
 
 	for i, check := range req.Checks {
 		go func(idx int, permCheck *pb.PermissionCheck) {
-			semaphore <- struct{}{} // Acquire semaphore
+			semaphore <- struct{}{}        // Acquire semaphore
 			defer func() { <-semaphore }() // Release semaphore
 
 			result := &pb.PermissionResult{
@@ -1508,7 +1567,7 @@ func (s *EnhancedAuthGRPCServer) invalidateUserCaches(ctx context.Context, userI
 // publishUserUpdatedEvent publishes a user updated event
 func (s *EnhancedAuthGRPCServer) publishUserUpdatedEvent(ctx context.Context, user *models.User, securityCtx *pb.SecurityContext) {
 	// This would integrate with the event publisher
-	s.logger.Info("User updated", 
+	s.logger.Info("User updated",
 		zap.String("user_id", user.ID.String()),
 		zap.String("email", user.Email))
 }
@@ -1516,7 +1575,7 @@ func (s *EnhancedAuthGRPCServer) publishUserUpdatedEvent(ctx context.Context, us
 // publishUserCreatedEvent publishes a user created event
 func (s *EnhancedAuthGRPCServer) publishUserCreatedEvent(ctx context.Context, user *models.User, securityCtx *services.SecurityContext) {
 	// This would integrate with the event publisher
-	s.logger.Info("User created", 
+	s.logger.Info("User created",
 		zap.String("user_id", user.ID.String()),
 		zap.String("email", user.Email))
 }
@@ -1624,22 +1683,22 @@ func (s *EnhancedAuthGRPCServer) convertEntityUserToProto(user *entities.User) *
 // convertEntityTokenPairToProto converts an entities.TokenPair to pb.TokenPair
 func (s *EnhancedAuthGRPCServer) convertEntityTokenPairToProto(tokenPair *entities.TokenPair) *pb.TokenPair {
 	return &pb.TokenPair{
-		AccessToken:       tokenPair.AccessToken,
-		RefreshToken:      tokenPair.RefreshToken,
-		ExpiresAt:         timestamppb.New(tokenPair.ExpiresAt),
-		RefreshExpiresAt:  timestamppb.New(tokenPair.RefreshExpiresAt),
-		TokenType:         tokenPair.TokenType,
+		AccessToken:      tokenPair.AccessToken,
+		RefreshToken:     tokenPair.RefreshToken,
+		ExpiresAt:        timestamppb.New(tokenPair.ExpiresAt),
+		RefreshExpiresAt: timestamppb.New(tokenPair.RefreshExpiresAt),
+		TokenType:        tokenPair.TokenType,
 	}
 }
 
 // serializeOrganization serializes a pb.Organization to bytes for caching
 func (s *EnhancedAuthGRPCServer) serializeOrganization(org *pb.Organization) ([]byte, error) {
-	return org.ProtoReflect().Interface().(interface{ Marshal() ([]byte, error) }).Marshal()
+	return proto.Marshal(org)
 }
 
 // deserializeOrganization deserializes bytes to a pb.Organization from cache
 func (s *EnhancedAuthGRPCServer) deserializeOrganization(data []byte, org *pb.Organization) error {
-	return org.ProtoReflect().Interface().(interface{ Unmarshal([]byte) error }).Unmarshal(data)
+	return proto.Unmarshal(data, org)
 }
 
 // processBulkUserCreation processes a batch of user creation requests
@@ -1710,13 +1769,13 @@ func (s *EnhancedAuthGRPCServer) processBulkUserUpdate(ctx context.Context, user
 
 		// Update user
 		updateReq := &pb.UpdateUserRequest{
-			UserId:    userData.UserId,
-			Email:     userData.Email,
-			FirstName: userData.FirstName,
-			LastName:  userData.LastName,
-			IsActive:  userData.IsActive,
+			UserId:     userData.UserId,
+			Email:      userData.Email,
+			FirstName:  userData.FirstName,
+			LastName:   userData.LastName,
+			IsActive:   userData.IsActive,
 			IsVerified: userData.IsVerified,
-			RoleIds:   userData.RoleIds,
+			RoleIds:    userData.RoleIds,
 			SecurityContext: &pb.SecurityContext{
 				IpAddress: "bulk-operation",
 				UserAgent: "grpc-bulk",
@@ -1915,7 +1974,7 @@ func (s *EnhancedAuthGRPCServer) ListUsers(ctx context.Context, req *pb.ListUser
 
 	// Build query - if OrganizationId is empty, list all users (for app admins)
 	query := s.db.WithContext(ctx)
-	
+
 	if req.OrganizationId != "" {
 		// Parse organization ID for organization-specific queries
 		orgID, err := uuid.Parse(req.OrganizationId)
@@ -1928,11 +1987,11 @@ func (s *EnhancedAuthGRPCServer) ListUsers(ctx context.Context, req *pb.ListUser
 		query = query.Where("organization_id = ?", orgID)
 	}
 	// If OrganizationId is empty, query all users (no WHERE clause for organization)
-	
+
 	// Add search filter if provided
 	if req.Search != "" {
 		searchTerm := "%" + req.Search + "%"
-		query = query.Where("first_name ILIKE ? OR last_name ILIKE ? OR email ILIKE ?", 
+		query = query.Where("first_name ILIKE ? OR last_name ILIKE ? OR email ILIKE ?",
 			searchTerm, searchTerm, searchTerm)
 	}
 
@@ -2003,7 +2062,7 @@ func (s *EnhancedAuthGRPCServer) GetUserStats(ctx context.Context, req *pb.GetUs
 
 	// Get user statistics
 	var stats pb.UserStats
-	
+
 	// Total users
 	var totalUsers int64
 	if err := s.db.WithContext(ctx).Model(&models.User{}).Where("organization_id = ?", orgID).Count(&totalUsers).Error; err != nil {
@@ -2076,21 +2135,28 @@ func (s *EnhancedAuthGRPCServer) GetSecurityStats(ctx context.Context, req *pb.G
 
 	s.logger.Debug("Getting security stats", zap.String("org_id", orgID.String()))
 
-	// Get security statistics
+	// Get security statistics via activity service (ES if enabled, otherwise DB)
 	var stats pb.SecurityStats
-	
-	// For now, return mock data since we don't have security event tables yet
-	// In a real implementation, these would query security event tables
-	stats.FailedLoginsToday = 0
-	stats.LockedAccounts = 0
-	stats.SecurityAlerts = 0
-	
-	// Two-factor authentication is disabled - always return 0
-	stats.TwoFactorEnabled = 0
-	
-	stats.PasswordResetsToday = 0
+	if s.activityService != nil {
+		m, err := s.activityService.GetSecurityStats(ctx, orgID)
+		if err != nil {
+			s.logger.Warn("GetSecurityStats: activity service failed, using defaults", zap.Error(err))
+		} else {
+			stats.FailedLoginsToday = int32(m["failed_logins_today"])
+			stats.SecurityAlerts = int32(m["security_alerts"])
+			// Optional metrics
+			if v, ok := m["two_factor_enabled"]; ok {
+				stats.TwoFactorEnabled = int32(v)
+			}
+			if v, ok := m["password_resets_today"]; ok {
+				stats.PasswordResetsToday = int32(v)
+			}
+		}
+	}
+	// Locked accounts not tracked here; keep 0 unless added elsewhere
+	// Ensure non-negative defaults
 
-	s.logger.Debug("Security stats retrieved successfully", 
+	s.logger.Debug("Security stats retrieved successfully",
 		zap.String("org_id", orgID.String()),
 		zap.Int32("two_factor_enabled", stats.TwoFactorEnabled))
 
@@ -2102,13 +2168,84 @@ func (s *EnhancedAuthGRPCServer) GetSecurityStats(ctx context.Context, req *pb.G
 
 // GetUserActivity implements GetUserActivity method for activity logs
 func (s *EnhancedAuthGRPCServer) GetUserActivity(ctx context.Context, req *pb.GetUserActivityRequest) (*pb.GetUserActivityResponse, error) {
-	// For now, return empty activity since we don't have activity logging tables yet
-	// In a real implementation, this would query activity log tables
-	
+	// Parse organization ID if provided
+	var orgID *uuid.UUID
+	if req.OrganizationId != "" {
+		parsedOrgID, err := uuid.Parse(req.OrganizationId)
+		if err != nil {
+			return &pb.GetUserActivityResponse{
+				Success: false,
+				Error:   "Invalid organization ID format",
+			}, nil
+		}
+		orgID = &parsedOrgID
+	}
+	// If OrganizationId is empty, orgID will be nil, which means "all organizations" for super admin
+
+	// Parse user ID if provided
+	var userID *uuid.UUID
+	if req.UserId != "" {
+		parsedUserID, err := uuid.Parse(req.UserId)
+		if err != nil {
+			return &pb.GetUserActivityResponse{
+				Success: false,
+				Error:   "Invalid user ID format",
+			}, nil
+		}
+		userID = &parsedUserID
+	}
+
+	// Set defaults for pagination
+	limit := int(req.Limit)
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	offset := int(req.Offset)
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Get activities from activity service (ES if enabled, otherwise DB)
+	activities, total, err := s.activityService.GetUserActivities(ctx, userID, orgID, limit, offset)
+	if err != nil {
+		s.logger.Error("Failed to get user activities", zap.Error(err))
+		return &pb.GetUserActivityResponse{
+			Success: false,
+			Error:   "Failed to retrieve user activities",
+		}, nil
+	}
+
+	// Convert to protobuf format
+	pbActivities := make([]*pb.UserActivity, len(activities))
+	for i, activity := range activities {
+		pbActivity := &pb.UserActivity{
+			Id:        activity.ID.String(),
+			UserId:    activity.UserID.String(),
+			Action:    activity.Action,
+			Resource:  activity.Resource,
+			Details:   activity.Details,
+			IpAddress: activity.IPAddress,
+			UserAgent: activity.UserAgent,
+			CreatedAt: timestamppb.New(activity.CreatedAt),
+		}
+
+		// Add user information if available
+		if activity.User.ID != uuid.Nil {
+			pbActivity.User = &pb.User{
+				Id:        activity.User.ID.String(),
+				FirstName: activity.User.FirstName,
+				LastName:  activity.User.LastName,
+				Email:     activity.User.Email,
+			}
+		}
+
+		pbActivities[i] = pbActivity
+	}
+
 	return &pb.GetUserActivityResponse{
 		Success:    true,
-		Activities: []*pb.UserActivity{},
-		TotalCount: 0,
+		Activities: pbActivities,
+		TotalCount: int32(total),
 	}, nil
 }
 
@@ -2302,7 +2439,7 @@ func (s *EnhancedAuthGRPCServer) ActivateUser(ctx context.Context, req *pb.Activ
 	// Update user
 	user.IsActive = true
 	user.UpdatedAt = time.Now()
-	
+
 	if err := s.db.WithContext(ctx).Save(&user).Error; err != nil {
 		s.logger.Error("Failed to activate user", zap.Error(err))
 		return &pb.ActivateUserResponse{
@@ -2358,7 +2495,7 @@ func (s *EnhancedAuthGRPCServer) DeactivateUser(ctx context.Context, req *pb.Dea
 	// Update user
 	user.IsActive = false
 	user.UpdatedAt = time.Now()
-	
+
 	if err := s.db.WithContext(ctx).Save(&user).Error; err != nil {
 		s.logger.Error("Failed to deactivate user", zap.Error(err))
 		return &pb.DeactivateUserResponse{
@@ -2414,7 +2551,7 @@ func (s *EnhancedAuthGRPCServer) VerifyUser(ctx context.Context, req *pb.VerifyU
 	// Update user
 	user.IsVerified = true
 	user.UpdatedAt = time.Now()
-	
+
 	if err := s.db.WithContext(ctx).Save(&user).Error; err != nil {
 		s.logger.Error("Failed to verify user", zap.Error(err))
 		return &pb.VerifyUserResponse{
@@ -2828,4 +2965,3 @@ func (s *EnhancedAuthGRPCServer) BulkDeleteUsers(ctx context.Context, req *pb.Bu
 		Results:      results,
 	}, nil
 }
-

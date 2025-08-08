@@ -57,9 +57,14 @@ func (m *MigrationManager) RunMigrations() error {
 			Up:          m.migration003AddPerformanceIndexes,
 		},
 		{
-			Version:     "004_create_materialized_views",
+			Version:     "004_add_user_activity_table",
+			Description: "Add user activity table for audit logging",
+			Up:          m.migration004AddUserActivityTable,
+		},
+		{
+			Version:     "005_create_materialized_views",
 			Description: "Create materialized views for complex queries",
-			Up:          m.migration004CreateMaterializedViews,
+			Up:          m.migration005CreateMaterializedViews,
 		},
 	}
 
@@ -133,6 +138,11 @@ func (m *MigrationManager) migration002AddTokenTable() error {
 	return m.db.AutoMigrate(&models.Token{})
 }
 
+// migration004AddUserActivityTable creates the user activity table
+func (m *MigrationManager) migration004AddUserActivityTable() error {
+	return m.db.AutoMigrate(&models.UserActivity{})
+}
+
 // migration003AddPerformanceIndexes adds performance-optimized indexes
 func (m *MigrationManager) migration003AddPerformanceIndexes() error {
 	// Composite indexes for common query patterns
@@ -160,8 +170,8 @@ func (m *MigrationManager) migration003AddPerformanceIndexes() error {
 	return nil
 }
 
-// migration004CreateMaterializedViews creates materialized views for complex queries
-func (m *MigrationManager) migration004CreateMaterializedViews() error {
+// migration005CreateMaterializedViews creates materialized views for complex queries
+func (m *MigrationManager) migration005CreateMaterializedViews() error {
 	// Create materialized view for user permissions (frequently queried)
 	userPermissionsView := `
 		CREATE MATERIALIZED VIEW IF NOT EXISTS user_permissions_mv AS

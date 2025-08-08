@@ -7,12 +7,13 @@ import (
 )
 
 type Config struct {
-	Database DatabaseConfig
-	Redis    RedisConfig
-	JWT      JWTConfig
-	Server   ServerConfig
-	GRPC     GRPCConfig
-	Kafka    KafkaConfig
+	Database      DatabaseConfig
+	Redis         RedisConfig
+	JWT           JWTConfig
+	Server        ServerConfig
+	GRPC          GRPCConfig
+	Kafka         KafkaConfig
+	Elasticsearch ElasticsearchConfig
 }
 
 type DatabaseConfig struct {
@@ -75,6 +76,15 @@ type KafkaConfig struct {
 	LocalStoragePath       string
 }
 
+type ElasticsearchConfig struct {
+	Addresses []string
+	Username  string
+	Password  string
+	APIKey    string
+	IndexName string
+	Enabled   bool
+}
+
 func Load() *Config {
 	return &Config{
 		Database: DatabaseConfig{
@@ -130,6 +140,14 @@ func Load() *Config {
 			DeadLetterTopic:        getEnv("KAFKA_DEAD_LETTER_TOPIC", "auth-events-dlq"),
 			EnableLocalPersistence: getEnvAsBool("KAFKA_ENABLE_LOCAL_PERSISTENCE", true),
 			LocalStoragePath:       getEnv("KAFKA_LOCAL_STORAGE_PATH", "/tmp/kafka-events"),
+		},
+		Elasticsearch: ElasticsearchConfig{
+			Addresses: strings.Split(getEnv("ELASTICSEARCH_ADDRESSES", "http://localhost:9200"), ","),
+			Username:  getEnv("ELASTICSEARCH_USERNAME", ""),
+			Password:  getEnv("ELASTICSEARCH_PASSWORD", ""),
+			APIKey:    getEnv("ELASTICSEARCH_API_KEY", ""),
+			IndexName: getEnv("ELASTICSEARCH_INDEX_NAME", "user-activities"),
+			Enabled:   getEnvAsBool("ELASTICSEARCH_ENABLED", true),
 		},
 	}
 }
