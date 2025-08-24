@@ -65,7 +65,7 @@ func (cw *CacheWarmerImpl) WarmKeys(ctx context.Context, keys []string) error {
 
 		go func(keyBatch []string) {
 			defer wg.Done()
-			semaphore <- struct{}{} // Acquire semaphore
+			semaphore <- struct{}{}        // Acquire semaphore
 			defer func() { <-semaphore }() // Release semaphore
 
 			cw.warmBatch(ctx, keyBatch)
@@ -130,11 +130,11 @@ func (cw *CacheWarmerImpl) WarmPattern(ctx context.Context, pattern string) erro
 	// Get Redis client from L2 cache
 	if redisCache, ok := cw.manager.l2Cache.(*RedisCacheImpl); ok {
 		client := redisCache.GetClient()
-		
+
 		// Scan for keys matching pattern
 		iter := client.Scan(ctx, 0, pattern, 0).Iterator()
 		var keys []string
-		
+
 		for iter.Next(ctx) {
 			key := iter.Val()
 			// Remove prefix if it exists
@@ -143,7 +143,7 @@ func (cw *CacheWarmerImpl) WarmPattern(ctx context.Context, pattern string) erro
 			}
 			keys = append(keys, key)
 		}
-		
+
 		if err := iter.Err(); err != nil {
 			cw.logger.Error("Failed to scan keys for pattern warming", zap.String("pattern", pattern), zap.Error(err))
 			return err
@@ -163,7 +163,7 @@ func (cw *CacheWarmerImpl) ScheduleWarming(ctx context.Context, keys []string, i
 	}
 
 	jobID := fmt.Sprintf("warm_%d", time.Now().UnixNano())
-	
+
 	cw.mu.Lock()
 	cw.warmJobs[jobID] = &WarmJob{
 		Keys:     keys,
@@ -173,7 +173,7 @@ func (cw *CacheWarmerImpl) ScheduleWarming(ctx context.Context, keys []string, i
 	}
 	cw.mu.Unlock()
 
-	cw.logger.Info("Scheduled cache warming", 
+	cw.logger.Info("Scheduled cache warming",
 		zap.String("job_id", jobID),
 		zap.Int("key_count", len(keys)),
 		zap.Duration("interval", interval))
@@ -190,7 +190,14 @@ func (cw *CacheWarmerImpl) startWarmingScheduler() {
 		return // Already running
 	}
 
-	cw.warmTicker = time.NewTicker(1 * time.Minute) // Check every minute
+	// Allow configuration to control checking frequency. Default to 15 minutes
+	// to avoid frequent work that may lead to high CPU and frequent Kafka logs.
+	interval := cw.manager.config.WarmupInterval
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+
+	cw.warmTicker = time.NewTicker(interval)
 
 	go func() {
 		for {
@@ -265,7 +272,7 @@ func (cw *CacheWarmerImpl) GetWarmingStats() map[string]interface{} {
 
 	stats := make(map[string]interface{})
 	stats["active_jobs"] = len(cw.warmJobs)
-	
+
 	activeJobs := 0
 	for _, job := range cw.warmJobs {
 		if job.Active {

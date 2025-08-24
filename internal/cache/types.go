@@ -26,13 +26,13 @@ const (
 
 // CacheEntry represents a cached item with metadata
 type CacheEntry struct {
-	Key       string
-	Value     []byte
-	TTL       time.Duration
-	CreatedAt time.Time
+	Key        string
+	Value      []byte
+	TTL        time.Duration
+	CreatedAt  time.Time
 	AccessedAt time.Time
-	HitCount  int64
-	Version   int64
+	HitCount   int64
+	Version    int64
 }
 
 // CacheStats provides cache performance metrics
@@ -103,12 +103,16 @@ type CacheConfig struct {
 	RedisConfig RedisClusterConfig
 
 	// General cache settings
-	DefaultTTL        time.Duration
-	MaxRetries        int
-	RetryDelay        time.Duration
-	EnableMetrics     bool
-	MetricsInterval   time.Duration
-	SyncInterval      time.Duration
+	DefaultTTL      time.Duration
+	MaxRetries      int
+	RetryDelay      time.Duration
+	EnableMetrics   bool
+	MetricsInterval time.Duration
+	SyncInterval    time.Duration
+	// WarmupInterval controls how often scheduled warming jobs are checked/run.
+	// If zero, the warmer will default to a conservative interval to avoid
+	// frequent work that can cause high CPU and logging noise.
+	WarmupInterval    time.Duration
 	WarmupEnabled     bool
 	WarmupBatchSize   int
 	InvalidationDelay time.Duration
