@@ -74,7 +74,25 @@ func (s *Seeder) SeedAll() error {
 func (s *Seeder) seedOrganizations() ([]models.Organization, error) {
 	log.Println("📊 Seeding organizations...")
 
+	// Create default organization with predictable UUID for AI Copilot service
+	defaultOrgID := uuid.MustParse("123e4567-e89b-12d3-a456-426614174000")
+
 	organizations := []models.Organization{
+		{
+			ID:     defaultOrgID,
+			Name:   "Default Organization",
+			Domain: "default.local",
+			Settings: models.Settings{
+				Timezone:         "UTC",
+				DateFormat:       "YYYY-MM-DD",
+				Currency:         "USD",
+				Language:         "en",
+				TwoFactorEnabled: false,
+				SessionTimeout:   3600,
+				CustomFields:     map[string]string{"type": "default"},
+			},
+			IsActive: true,
+		},
 		{
 			Name:   "UniBASE ERP Solutions",
 			Domain: "unibaseerp.com",
