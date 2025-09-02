@@ -1,0 +1,68 @@
+services:
+  auth-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ${COMPOSE_PROJECT_NAME:-erp-suite}-auth-service
+    user: "1000:1000"
+    working_dir: /app
+    command: /go/bin/air -c .air.toml
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: erp_auth
+      DB_USER: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      DB_SSL_MODE: disable
+      DB_MAX_OPEN_CONNS: 10
+      DB_MAX_IDLE_CONNS: 5
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redispassword}
+      REDIS_DB: 0
+      REDIS_POOL_SIZE: 5
+      KAFKA_BROKERS: kafka:${KAFKA_INTERNAL_PORT:-29092}
+      KAFKA_TOPIC: auth-events
+      KAFKA_RETRY_ATTEMPTS: 2
+      KAFKA_RETRY_BACKOFF_MS: 500
+      KAFKA_BATCH_SIZE: 50
+      KAFKA_BATCH_TIMEOUT_MS: 100
+      KAFKA_CONNECTION_POOL_SIZE: 3
+      KAFKA_LOCAL_QUEUE_SIZE: 1000
+      KAFKA_GROUP_ID: auth-service-group
+      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      JWT_ACCESS_EXPIRY: 3600
+      JWT_REFRESH_EXPIRY: 604800
+      HTTP_PORT: ${AUTH_SERVICE_HTTP_PORT:-8080}
+      PORT: ${AUTH_SERVICE_HTTP_PORT:-8080}
+      GIN_MODE: debug
+      ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000,http://localhost,http://localhost:4000,http://erp-frontend:3000,http://api-gateway:8000,http://ai-copilot:8003
+      GRPC_PORT: ${AUTH_SERVICE_GRPC_PORT:-50051}
+      GRPC_MAX_CONNECTION_IDLE: 60
+      GRPC_MAX_CONNECTION_AGE: 120
+      GRPC_MAX_CONCURRENT_STREAMS: 100
+      GOGC: 100
+      GOMEMLIMIT: 256MiB
+      ENV: ${NODE_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+    ports:
+      - "${AUTH_SERVICE_HTTP_PORT:-8080}:${AUTH_SERVICE_HTTP_PORT:-8080}"
+    volumes:
+      - ./:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${AUTH_SERVICE_HTTP_PORT:-8080}/health"]
+      interval: 300s
+      timeout: 10s
+      retries: 2
+      start_period: 60s
+    networks:
+      - erp-network
+    profiles:
+      - full-stack
