@@ -467,7 +467,16 @@ func (s *TokenService) updateMetrics(updateFunc func(*TokenMetrics)) {
 func (s *TokenService) GetMetrics() TokenMetrics {
 	s.metrics.mu.RLock()
 	defer s.metrics.mu.RUnlock()
-	return *s.metrics
+	// Return a copy without the mutex
+	return TokenMetrics{
+		TokensGenerated:  s.metrics.TokensGenerated,
+		TokensValidated:  s.metrics.TokensValidated,
+		TokensRevoked:    s.metrics.TokensRevoked,
+		CacheHits:        s.metrics.CacheHits,
+		CacheMisses:      s.metrics.CacheMisses,
+		ValidationErrors: s.metrics.ValidationErrors,
+		KeyRotations:     s.metrics.KeyRotations,
+	}
 }
 
 // Cache management methods
@@ -484,6 +493,14 @@ func (s *TokenService) cacheTokens(ctx context.Context, accessToken, refreshToke
 		KeyVersion:     s.getKeyVersion(),
 		IPAddress:      accessEntity.IPAddress,
 		DeviceFingerprint: accessEntity.DeviceFingerprint,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   accessEntity.UserID.String(),
+			IssuedAt:  jwt.NewNumericDate(accessEntity.IssuedAt),
+			ExpiresAt: jwt.NewNumericDate(accessEntity.ExpiresAt),
+			NotBefore: jwt.NewNumericDate(accessEntity.IssuedAt),
+			Issuer:    "erp-auth-service",
+			Audience:  []string{"erp-suite"},
+		},
 	}
 	
 	if err := s.cacheTokenClaims(ctx, accessHash, accessClaims); err != nil {
@@ -500,6 +517,14 @@ func (s *TokenService) cacheTokens(ctx context.Context, accessToken, refreshToke
 		KeyVersion:     s.getKeyVersion(),
 		IPAddress:      refreshEntity.IPAddress,
 		DeviceFingerprint: refreshEntity.DeviceFingerprint,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   refreshEntity.UserID.String(),
+			IssuedAt:  jwt.NewNumericDate(refreshEntity.IssuedAt),
+			ExpiresAt: jwt.NewNumericDate(refreshEntity.ExpiresAt),
+			NotBefore: jwt.NewNumericDate(refreshEntity.IssuedAt),
+			Issuer:    "erp-auth-service",
+			Audience:  []string{"erp-suite"},
+		},
 	}
 	
 	if err := s.cacheTokenClaims(ctx, refreshHash, refreshClaims); err != nil {

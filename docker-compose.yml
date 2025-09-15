@@ -41,6 +41,9 @@ services:
       GRPC_MAX_CONNECTION_IDLE: 60
       GRPC_MAX_CONNECTION_AGE: 120
       GRPC_MAX_CONCURRENT_STREAMS: 100
+      ELASTICSEARCH_ADDRESSES: http://elasticsearch:9200
+      ELASTICSEARCH_ENABLED: true
+      ELASTICSEARCH_INDEX_NAME: user-activities
       GOGC: 100
       GOMEMLIMIT: 256MiB
       ENV: ${NODE_ENV:-development}
@@ -55,6 +58,8 @@ services:
       redis:
         condition: service_started
       kafka:
+        condition: service_healthy
+      elasticsearch:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${AUTH_SERVICE_HTTP_PORT:-8080}/health"]

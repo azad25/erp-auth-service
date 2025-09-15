@@ -175,7 +175,15 @@ func (wp *WorkerPool) GetMetrics() WorkerPoolMetrics {
 	// Update queue length
 	wp.metrics.QueueLength = int64(len(wp.jobQueue))
 	
-	return *wp.metrics
+	// Return a copy without the mutex
+	return WorkerPoolMetrics{
+		JobsSubmitted:   wp.metrics.JobsSubmitted,
+		JobsCompleted:   wp.metrics.JobsCompleted,
+		JobsInProgress:  wp.metrics.JobsInProgress,
+		ActiveWorkers:   wp.metrics.ActiveWorkers,
+		QueueLength:     wp.metrics.QueueLength,
+		AverageJobTime:  wp.metrics.AverageJobTime,
+	}
 }
 
 // GetStatus returns the current status of the worker pool

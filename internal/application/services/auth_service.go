@@ -856,7 +856,18 @@ func (s *AuthService) updateMetrics(updateFunc func(*AuthMetrics)) {
 func (s *AuthService) GetMetrics() AuthMetrics {
 	s.metrics.mu.RLock()
 	defer s.metrics.mu.RUnlock()
-	return *s.metrics
+	// Return a copy without the mutex
+	return AuthMetrics{
+		AuthenticationAttempts:   s.metrics.AuthenticationAttempts,
+		SuccessfulLogins:         s.metrics.SuccessfulLogins,
+		FailedLogins:             s.metrics.FailedLogins,
+		RegistrationAttempts:     s.metrics.RegistrationAttempts,
+		SuccessfulRegistrations:  s.metrics.SuccessfulRegistrations,
+		PasswordChanges:          s.metrics.PasswordChanges,
+		TwoFactorEnabled:         s.metrics.TwoFactorEnabled,
+		BruteForceBlocked:        s.metrics.BruteForceBlocked,
+		RateLimitBlocked:         s.metrics.RateLimitBlocked,
+	}
 }
 
 // Close gracefully shuts down the authentication service

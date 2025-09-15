@@ -280,11 +280,18 @@ func (php *PasswordHashingPool) updateHashingMetrics(duration time.Duration) {
 	}
 }
 
-// GetHashingMetrics returns password hashing metrics
-func (php *PasswordHashingPool) GetHashingMetrics() PasswordHashingMetrics {
+// GetMetrics returns current password hashing pool metrics
+func (php *PasswordHashingPool) GetMetrics() PasswordHashingMetrics {
 	php.metrics.mu.RLock()
 	defer php.metrics.mu.RUnlock()
-	return *php.metrics
+	// Return a copy without the mutex
+	return PasswordHashingMetrics{
+		HashingRequests:  php.metrics.HashingRequests,
+		HashingCompleted: php.metrics.HashingCompleted,
+		HashingFailed:    php.metrics.HashingFailed,
+		AverageHashTime:  php.metrics.AverageHashTime,
+		TotalHashTime:    php.metrics.TotalHashTime,
+	}
 }
 
 // NewHashingRateLimiter creates a new hashing rate limiter
@@ -530,7 +537,14 @@ func (cwp *CacheWarmingPool) updateWarmingMetrics(duration time.Duration) {
 func (cwp *CacheWarmingPool) GetWarmingMetrics() CacheWarmingMetrics {
 	cwp.metrics.mu.RLock()
 	defer cwp.metrics.mu.RUnlock()
-	return *cwp.metrics
+	// Return a copy without the mutex
+	return CacheWarmingMetrics{
+		WarmingTasks:        cwp.metrics.WarmingTasks,
+		WarmingCompleted:    cwp.metrics.WarmingCompleted,
+		WarmingFailed:       cwp.metrics.WarmingFailed,
+		CacheHitImprovement: cwp.metrics.CacheHitImprovement,
+		AverageWarmTime:     cwp.metrics.AverageWarmTime,
+	}
 }
 
 // NewWarmingTaskScheduler creates a new warming task scheduler
@@ -680,7 +694,14 @@ func (alp *AuditLoggingPool) updateAuditMetrics(duration time.Duration) {
 func (alp *AuditLoggingPool) GetAuditMetrics() AuditLoggingMetrics {
 	alp.metrics.mu.RLock()
 	defer alp.metrics.mu.RUnlock()
-	return *alp.metrics
+	// Return a copy without the mutex
+	return AuditLoggingMetrics{
+		AuditEvents:        alp.metrics.AuditEvents,
+		EventsProcessed:    alp.metrics.EventsProcessed,
+		EventsFailed:       alp.metrics.EventsFailed,
+		BatchesProcessed:   alp.metrics.BatchesProcessed,
+		AverageProcessTime: alp.metrics.AverageProcessTime,
+	}
 }
 
 // NewAuditBatchProcessor creates a new audit batch processor
@@ -831,7 +852,7 @@ func (swpm *SpecializedWorkerPoolManager) GetAuditPool() *AuditLoggingPool {
 // GetAllSpecializedMetrics returns metrics for all specialized pools
 func (swpm *SpecializedWorkerPoolManager) GetAllSpecializedMetrics() map[string]interface{} {
 	return map[string]interface{}{
-		"password_hashing": swpm.passwordPool.GetHashingMetrics(),
+		"password_hashing": swpm.passwordPool.GetMetrics(),
 		"cache_warming":    swpm.cachePool.GetWarmingMetrics(),
 		"audit_logging":    swpm.auditPool.GetAuditMetrics(),
 		"base_pools":       swpm.GetAllMetrics(),

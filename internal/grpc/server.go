@@ -548,13 +548,26 @@ func (s *EnhancedAuthGRPCServer) ValidateToken(ctx context.Context, req *pb.Vali
 		}, nil
 	}
 
-	return &pb.ValidateTokenResponse{
+	// Prepare response with nil checks
+	response := &pb.ValidateTokenResponse{
 		Valid:          true,
 		UserId:         claims.UserID.String(),
 		OrganizationId: claims.OrganizationID.String(),
 		Email:          claims.Email,
-		ExpiresAt:      timestamppb.New(claims.ExpiresAt.Time),
-	}, nil
+	}
+	
+	// Safely handle ExpiresAt field
+	if claims.ExpiresAt != nil {
+		response.ExpiresAt = timestamppb.New(claims.ExpiresAt.Time)
+	} else {
+		s.logger.Warn("Token claims missing ExpiresAt field", 
+			zap.String("user_id", claims.UserID.String()),
+			zap.String("token_type", claims.TokenType))
+		// Set a default expiration time or return error based on security policy
+		response.ExpiresAt = timestamppb.New(time.Now().Add(time.Hour))
+	}
+	
+	return response, nil
 }
 
 // RefreshToken creates new tokens with atomic operations
